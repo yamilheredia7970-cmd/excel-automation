@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+"""Automatiza la carga de Ingresos Brutos (AGIP) en la planilla de clientes.
+
+Uso:
+    python iibb_agip_scraper.py --crear-demo
+    python iibb_agip_scraper.py --excel demo.xlsx --dry-run
+    python iibb_agip_scraper.py --excel demo.xlsx --cuit 20111111112 --sin-headless
+    python iibb_agip_scraper.py --excel "IIBB_ANUAL_2025.xlsx"
+
+Este archivo no contiene ninguna credencial. El usuario de AGIP es el
+CUIT/CUIL de cada cliente y la contrasena se lee en tiempo de ejecucion de
+la celda que esta al lado del CUIT en las hojas "DIA N" (y "DIA N - 2025",
+que el script genera solo la primera vez que corre). Si un cliente nuevo de
+2025 no tiene contrasena cargada todavia, se salta y se avisa por consola.
+
+Limitacion conocida: el login y la extraccion de datos de AGIP estan
+escritos a partir de las instrucciones de la hoja DETALLE, sin haber podido
+probarlos contra el sitio real. Es muy probable que el primer intento
+necesite un ajuste de selectores en las funciones iniciar_sesion(),
+ir_a_declaracion() y extraer_campos().
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import re
+import shutil
+import sys
+import time
+import unicodedata
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, Border, Side
+from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.worksheet.worksheet import Worksheet
+
+# --------------------------------------------------------------------------
+# Vocabulario del dominio (basado en las hojas "Lista de Clientes - IIBB",
+# "DETALLE" y "DIA 1".."DIA 8" del archivo original)
+# --------------------------------------------------------------------------
+
+HOJA_CLIENTES = "Lista de Clientes - IIBB"
+SUFIJO_2025 = " - 2025"
+RE_HOJA_DIA_2024 = re.compile(r"^DIA\s+\d+$", re.I)
+RE_HOJA_DIA_2025 = re.compile(r"^DIA\s+\d+\s*-\s*2025$", re.I)
+
+BASE_URL = "https://www.agip.gob.ar"
+
+MESES = ["ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO", "JULIO",
+         "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"]
+
+CONCEPTOS = [
+    "base imponible",
+    "anticipo determinado",
+    "retenciones",
+    "retenciones bancarias",
+    "percepciones",
+    "impuestos internos",
+    "pago a cuenta",
+    "otros creditos",
+    "saldo a favor",
+    "importe a pagar(subtotal)",
+    "intereses",
+    "total pagado",
+]
+
+# Concepto -> texto de etiqueta a buscar en la pagina de la DDJJ de AGIP.
+# La ruta completa dentro de e-Sicol (segun la hoja DETALLE) queda como
+# comentario, de referencia para quien tenga que ajustar esto mirando el
+# sitio real. "intereses" no tiene campo propio: sale de restar
+# total_pagado - importe_a_pagar_subtotal (asi lo indica DETALLE).
+UBICACION_AGIP = {
+    "base imponible": "Base Imponible",                  # Rubro 1 - Determinacion del anticipo
+    "anticipo determinado": "Valor",                      # Rubro 1 - Determinacion del anticipo (etiqueta generica, ver nota abajo)
+    "retenciones": "Retenciones",                          # Retenciones / Agentes
+    "retenciones bancarias": "Retenciones Bancarias",      # Retenciones / Bancarias
+    "percepciones": "Percepciones",                        # Percepciones / Agentes
+    "impuestos internos": "Impuestos Internos",            # Conceptos que no integran la base imponible
+    "otros creditos": "Saldo a favor DDJJ periodo anterior",
+    "saldo a favor": "Subtotal a favor del contribuyente",
+    "importe a pagar(subtotal)": "Importe neto a ingresar",
+    "total pagado": "Total importe actualizado",
+    "alicuota": "Alicuota",                                # Rubro 1 - Determinacion del anticipo
+}
+# Nota: "Valor" es una etiqueta muy generica. Si extrae el numero incorrecto
+# para "anticipo determinado", es el primer lugar donde hay que mirar.
+
+UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
+PAUSA_ENTRE_CLIENTES = 1.5  # segundos, para no golpear el sitio sin pausa
+
+logger = logging.getLogger("iibb_agip")
+
+
+# --------------------------------------------------------------------------
+# Utilidades de texto
+# --------------------------------------------------------------------------
+
+def normalizar(texto) -> str:
+    if texto is None:
+        return ""
+    texto = str(texto).strip().lower()
+    texto = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", texto)
+
+
+MESES_NORM = [normalizar(m) for m in MESES]
+
+PATRON_NUMERO = re.compile(r"-?\$?\s*([\d.]*\d(?:,\d+)?)")
+
+
+def parsear_numero_ar(texto: Optional[str]) -> Optional[float]:
+    """Convierte '$ 1.234,56' o '1234.56' a float. None si no encuentra numero."""
+    if not texto:
+        return None
+    texto = texto.strip()
+    if not texto or texto in {"-", "--"}:
+        return None
+    m = PATRON_NUMERO.search(texto)
+    if not m:
+        return None
+    crudo = m.group(1)
+    if "," in crudo:
+        crudo = crudo.replace(".", "").replace(",", ".")
+    try:
+        return float(crudo)
+    except ValueError:
+        return None
+
+
+# --------------------------------------------------------------------------
+# Modelo: un bloque = los datos de un cliente dentro de una hoja "DIA N"
+# --------------------------------------------------------------------------
+
+@dataclass
+class BloqueCliente:
+    hoja: str
+    anio: int
+    nombre: str
+    cuit: Optional[int]
+    password: Optional[str]
+    fila_encabezado: int
+    columnas_mes: Dict[int, str]       # 1..12 -> "B".."M"
+    filas_concepto: Dict[str, int]     # concepto normalizado -> fila
+    fila_alicuota: Optional[int]
+
+
+def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
+    """Recorre una hoja DIA-N y arma un BloqueCliente por cada cliente.
+
+    No asume posiciones fijas de fila: cada concepto se identifica por el
+    texto de la columna A (case/acentos insensible), porque en el archivo
+    real el orden y la presencia de filas varia de cliente a cliente.
+    """
+    encabezados = [
+        fila for fila in range(1, ws.max_row + 1)
+        if normalizar(ws.cell(row=fila, column=2).value) == "enero"
+    ]
+
+    bloques: List[BloqueCliente] = []
+    for i, fila_inicio in enumerate(encabezados):
+        fila_fin = encabezados[i + 1] - 1 if i + 1 < len(encabezados) else ws.max_row
+        nombre = ws.cell(row=fila_inicio, column=1).value or f"(sin nombre, fila {fila_inicio})"
+
+        columnas_mes: Dict[int, str] = {}
+        for col in range(2, ws.max_column + 1):
+            texto = normalizar(ws.cell(row=fila_inicio, column=col).value)
+            if texto in MESES_NORM:
+                columnas_mes[MESES_NORM.index(texto) + 1] = get_column_letter(col)
+
+        filas_concepto: Dict[str, int] = {}
+        fila_total_pagado = None
+        cuit_valor = None
+        password = None
+
+        for fila in range(fila_inicio + 1, fila_fin + 1):
+            valor_a = ws.cell(row=fila, column=1).value
+            texto_a = normalizar(valor_a)
+
+            if texto_a in CONCEPTOS and texto_a not in filas_concepto:
+                filas_concepto[texto_a] = fila
+                if texto_a == "total pagado":
+                    fila_total_pagado = fila
+                continue
+
+            if isinstance(valor_a, (int, float)) and valor_a >= UMBRAL_CUIT and cuit_valor is None:
+                cuit_valor = int(valor_a)
+                valor_b = ws.cell(row=fila, column=2).value
+                if isinstance(valor_b, str) and valor_b.strip():
+                    password = valor_b.strip()
+
+        fila_alicuota = None
+        if fila_total_pagado is not None:
+            candidata = fila_total_pagado + 1
+            if candidata <= fila_fin and normalizar(ws.cell(row=candidata, column=1).value) == "":
+                fila_alicuota = candidata
+
+        bloques.append(BloqueCliente(
+            hoja=ws.title, anio=anio, nombre=str(nombre).strip(), cuit=cuit_valor,
+            password=password, fila_encabezado=fila_inicio, columnas_mes=columnas_mes,
+            filas_concepto=filas_concepto, fila_alicuota=fila_alicuota,
+        ))
+    return bloques
+
+
+def indexar_workbook(wb) -> Dict[Tuple[int, int], BloqueCliente]:
+    """Escanea todas las hojas DIA-N (2024) y DIA-N - 2025 y arma un indice
+    (anio, cuit) -> BloqueCliente."""
+    indice: Dict[Tuple[int, int], BloqueCliente] = {}
+    for nombre in wb.sheetnames:
+        nombre_limpio = nombre.strip()
+        if RE_HOJA_DIA_2025.match(nombre_limpio):
+            anio = 2025
+        elif RE_HOJA_DIA_2024.match(nombre_limpio):
+            anio = 2024
+        else:
+            continue
+        for bloque in parsear_hoja_dia(wb[nombre], anio):
+            if bloque.cuit:
+                indice[(anio, bloque.cuit)] = bloque
+            else:
+                logger.warning("No pude identificar el CUIT de %r en %s (fila %s)",
+                                bloque.nombre, nombre, bloque.fila_encabezado)
+    return indice
+
+
+# --------------------------------------------------------------------------
+# Padron de clientes ("Lista de Clientes - IIBB") y generacion de hojas 2025
+# --------------------------------------------------------------------------
+
+def normalizar_dia(texto: str) -> str:
+    m = re.search(r"\d+", texto)
+    return f"DIA {m.group()}" if m else texto.strip()
+
+
+def leer_padron(wb) -> Dict[int, List[Tuple[str, int, str]]]:
+    """Lee la hoja 'Lista de Clientes - IIBB': para cada anio, la lista de
+    (nombre, cuit, dia_asignado)."""
+    ws = wb[HOJA_CLIENTES]
+    padron: Dict[int, List[Tuple[str, int, str]]] = {2024: [], 2025: []}
+    columnas = {2024: (1, 2), 2025: (4, 5)}
+    for anio, (col_nombre, col_cuit) in columnas.items():
+        dia_actual = "DIA 1"
+        for fila in range(3, ws.max_row + 1):
+            nombre = ws.cell(row=fila, column=col_nombre).value
+            cuit = ws.cell(row=fila, column=col_cuit).value
+            if isinstance(nombre, str) and normalizar(nombre).startswith("dia "):
+                dia_actual = normalizar_dia(nombre)
+                continue
+            if nombre and isinstance(cuit, (int, float)):
+                padron[anio].append((str(nombre).strip(), int(cuit), dia_actual))
+    return padron
+
+
+FUENTE_TITULO = Font(bold=True)
+FORMATO_MONEDA = "#,##0.00"
+
+
+def _escribir_bloque_vacio(ws: Worksheet, fila_inicio: int, nombre: str,
+                            cuit: int, password: Optional[str] = None) -> int:
+    """Escribe la estructura vacia de un cliente (encabezado + 12 conceptos +
+    alicuota + CUIT/password) y devuelve la fila donde deberia empezar el
+    siguiente bloque. El formato es simple y consistente, no una copia
+    pixel-a-pixel de las hojas originales (que tienen estilos hechos a mano
+    y ligeramente distintos entre si)."""
+    ws.cell(row=fila_inicio, column=1, value=nombre).font = FUENTE_TITULO
+    for i, mes in enumerate(MESES):
+        ws.cell(row=fila_inicio, column=2 + i, value=mes).font = FUENTE_TITULO
+
+    fila = fila_inicio + 1
+    for concepto in CONCEPTOS:
+        etiqueta = "Importe a pagar(subtotal)" if concepto == "importe a pagar(subtotal)" else concepto.title()
+        ws.cell(row=fila, column=1, value=etiqueta)
+        for col in range(2, 14):
+            ws.cell(row=fila, column=col).number_format = FORMATO_MONEDA
+        ws.cell(row=fila, column=14, value=f"=SUM(B{fila}:M{fila})").number_format = FORMATO_MONEDA
+        fila += 1
+
+    fila_alicuota = fila
+    for col in range(2, 14):
+        ws.cell(row=fila_alicuota, column=col).number_format = "0.00"
+    fila += 1
+
+    ws.cell(row=fila, column=1, value=cuit)
+    if password:
+        ws.cell(row=fila, column=2, value=password)
+    fila += 2  # una fila en blanco de separacion antes del siguiente bloque
+    return fila
+
+
+def crear_hojas_2025(wb, padron: Dict[int, List[Tuple[str, int, str]]],
+                      indice_2024: Dict[Tuple[int, int], BloqueCliente]
+                      ) -> List[Tuple[str, int, str, int]]:
+    """Crea 'DIA N - 2025' para cada dia que aparezca en el padron 2025, con
+    un bloque vacio por cliente. Si el cliente ya existia en 2024, copia su
+    contrasena (se asume la misma clave ciudad). Es idempotente: si la hoja
+    ya existe, no la vuelve a crear. Devuelve la lista de clientes sin
+    contrasena conocida."""
+    sin_password: List[Tuple[str, int, str, int]] = []
+    dias = sorted({dia for _, _, dia in padron[2025]},
+                  key=lambda d: int(re.search(r"\d+", d).group()))
+
+    for dia in dias:
+        nombre_hoja = f"{dia}{SUFIJO_2025}"
+        if nombre_hoja in wb.sheetnames:
+            continue
+        ws = wb.create_sheet(nombre_hoja)
+        ws.column_dimensions["A"].width = 32
+        for col in range(2, 15):
+            ws.column_dimensions[get_column_letter(col)].width = 14
+
+        fila = 1
+        clientes = [(n, c) for n, c, d in padron[2025] if d == dia]
+        for nombre, cuit in clientes:
+            previo = indice_2024.get((2024, cuit))
+            password = previo.password if previo else None
+            fila_cuit_prevista = fila + 1 + len(CONCEPTOS) + 1
+            fila = _escribir_bloque_vacio(ws, fila, nombre, cuit, password)
+            if not password:
+                sin_password.append((nombre, cuit, nombre_hoja, fila_cuit_prevista))
+        logger.info("Hoja %s creada con %d clientes", nombre_hoja, len(clientes))
+
+    return sin_password
+
+
+# --------------------------------------------------------------------------
+# Deteccion de meses pendientes
+# --------------------------------------------------------------------------
+
+def meses_pendientes(ws: Worksheet, bloque: BloqueCliente) -> List[int]:
+    """Un mes se considera 'hecho' si Base Imponible y Total pagado ya
+    tienen algo cargado (aunque sea 0). Si falta alguno de los dos, se
+    considera pendiente y hay que ir a buscarlo a AGIP."""
+    fila_bi = bloque.filas_concepto.get("base imponible")
+    fila_tp = bloque.filas_concepto.get("total pagado")
+    if not fila_bi or not fila_tp:
+        return []
+    pendientes = []
+    for mes, col in sorted(bloque.columnas_mes.items()):
+        v1 = ws[f"{col}{fila_bi}"].value
+        v2 = ws[f"{col}{fila_tp}"].value
+        if v1 in (None, "") or v2 in (None, ""):
+            pendientes.append(mes)
+    return pendientes
+
+
+# --------------------------------------------------------------------------
+# Guardado seguro
+# --------------------------------------------------------------------------
+
+def guardar_workbook(wb, ruta: Path) -> None:
+    tmp = ruta.with_suffix(f".tmp{ruta.suffix}")
+    wb.save(tmp)
+    tmp.replace(ruta)
+
+
+# --------------------------------------------------------------------------
+# Automatizacion del navegador (Playwright). Import perezoso para que
+# --dry-run y --crear-demo funcionen sin tener playwright instalado.
+# --------------------------------------------------------------------------
+
+def _importar_playwright():
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise SystemExit(
+            "Falta playwright. Instalalo con:\n"
+            "  pip install playwright\n"
+            "  playwright install chromium"
+        ) from exc
+    return sync_playwright
+
+
+def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
+    loc = page.get_by_text(re.compile(patron_texto, re.I)).first
+    try:
+        loc.wait_for(state="visible", timeout=tiempo)
+    except Exception:
+        return False
+    loc.click()
+    return True
+
+
+def iniciar_sesion(page, cuit: int, password: str, tiempo_espera: int) -> bool:
+    """Entra a agip.gob.ar, hace click en 'Accede con Clave Ciudad' y
+    completa usuario (CUIT) / contrasena. El campo de contrasena se ubica
+    por type=password, que es un ancla confiable independientemente del
+    resto del markup; el de usuario se busca como el primer input de texto
+    dentro del mismo <form>."""
+    page.goto(BASE_URL, wait_until="domcontentloaded")
+
+    if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", tiempo_espera):
+        logger.error("No encontre el enlace 'Accede con Clave Ciudad' en %s", BASE_URL)
+        return False
+
+    campo_password = page.locator('input[type="password"]').first
+    try:
+        campo_password.wait_for(state="visible", timeout=tiempo_espera)
+    except Exception:
+        logger.error("No aparecio el campo de contrasena tras entrar a Clave Ciudad")
+        return False
+
+    formulario = campo_password.locator("xpath=ancestor::form[1]")
+    campo_usuario = formulario.locator('input[type="text"], input[type="tel"], input:not([type])').first
+    campo_usuario.fill(str(cuit))
+    campo_password.fill(password)
+
+    boton = formulario.get_by_role("button", name=re.compile(r"ingresar|entrar|iniciar", re.I))
+    if boton.count() > 0:
+        boton.first.click()
+    else:
+        campo_password.press("Enter")
+
+    try:
+        page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+    except Exception:
+        pass
+    return "agip.gob.ar" in page.url
+
+
+def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
+    """Navega e-Sicol -> Declaraciones Juradas presentadas -> anio -> mes."""
+    if not _click_si_existe(page, r"e-?sicol", tiempo_espera):
+        logger.error("No encontre el enlace 'e-Sicol'")
+        return False
+    page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+
+    _click_si_existe(page, r"declaraciones?\s+juradas\s+presentadas", tiempo_espera)
+    page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+
+    _click_si_existe(page, str(anio), tiempo_espera)
+    page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+
+    if not _click_si_existe(page, MESES[mes_idx - 1], tiempo_espera):
+        return False
+    page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+    return True
+
+
+def expandir_secciones(page, tiempo: int) -> None:
+    """Las Retenciones/Percepciones parecen estar en pestañas o acordeones
+    plegados (asi lo describe DETALLE: 'Desplegar la pestaña...'). Intenta
+    abrirlas; si ya estan abiertas o no existen como tales, no hace nada."""
+    for texto in ("Retenciones", "Percepciones"):
+        _click_si_existe(page, texto, tiempo)
+
+
+def obtener_valor_por_etiqueta(page, etiqueta: str, tiempo: int) -> Optional[str]:
+    """Busca un texto en la pagina y devuelve el numero que encuentra al
+    lado (hermano siguiente, fila de tabla, o padre). Prueba primero
+    coincidencia exacta (mas segura) y despues por substring."""
+    patrones = [
+        re.compile(rf"^\s*{re.escape(etiqueta)}\s*:?\s*$", re.I),
+        re.compile(re.escape(etiqueta), re.I),
+    ]
+    xpaths = (
+        "xpath=following-sibling::*[1]",
+        "xpath=../following-sibling::*[1]",
+        "xpath=ancestor::tr[1]//td[last()]",
+        "xpath=parent::*",
+    )
+    for patron in patrones:
+        loc = page.get_by_text(patron).first
+        try:
+            loc.wait_for(state="visible", timeout=tiempo)
+        except Exception:
+            continue
+        for xp in xpaths:
+            try:
+                texto = loc.locator(xp).inner_text(timeout=800)
+            except Exception:
+                continue
+            if parsear_numero_ar(texto) is not None:
+                return texto
+    return None
+
+
+def extraer_campos(page, tiempo_espera: int) -> Dict[str, float]:
+    """Extrae los valores de la DDJJ actualmente abierta. 'intereses' se
+    calcula (no tiene campo propio), segun la nota de la hoja DETALLE."""
+    expandir_secciones(page, tiempo_espera)
+    valores: Dict[str, float] = {}
+
+    for concepto, etiqueta in UBICACION_AGIP.items():
+        if concepto in ("intereses", "total pagado"):
+            continue
+        texto = obtener_valor_por_etiqueta(page, etiqueta, tiempo_espera)
+        numero = parsear_numero_ar(texto)
+        if numero is not None:
+            valores[concepto] = numero
+        else:
+            logger.warning("No encontre '%s' en la pagina", etiqueta)
+
+    texto_total = obtener_valor_por_etiqueta(page, UBICACION_AGIP["total pagado"], tiempo_espera)
+    texto_importe = obtener_valor_por_etiqueta(page, UBICACION_AGIP["importe a pagar(subtotal)"], tiempo_espera)
+    total_pagina = parsear_numero_ar(texto_total)
+    importe_subtotal = parsear_numero_ar(texto_importe)
+    if total_pagina is not None:
+        valores["total pagado"] = total_pagina
+    if total_pagina is not None and importe_subtotal is not None:
+        valores["intereses"] = round(total_pagina - importe_subtotal, 2)
+
+    return valores
+
+
+def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, valores: Dict[str, float]) -> None:
+    col = bloque.columnas_mes[mes]
+    col_idx = column_index_from_string(col)
+    for concepto, valor in valores.items():
+        fila = bloque.filas_concepto.get(concepto)
+        if fila:
+            ws.cell(row=fila, column=col_idx, value=valor)
+    if bloque.fila_alicuota and "alicuota" in valores:
+        ws.cell(row=bloque.fila_alicuota, column=col_idx, value=valores["alicuota"])
+
+
+def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: List[int],
+                      tiempo_espera: int, guardar_cb) -> None:
+    logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes",
+                bloque.nombre, bloque.cuit, bloque.anio, len(pendientes))
+    if not iniciar_sesion(page, bloque.cuit, bloque.password, tiempo_espera):
+        logger.error("No pude iniciar sesion para CUIT %s", bloque.cuit)
+        return
+
+    for mes in pendientes:
+        try:
+            if not ir_a_declaracion(page, bloque.anio, mes, tiempo_espera):
+                logger.warning("CUIT %s: no encontre la DDJJ de %s/%s", bloque.cuit, MESES[mes - 1], bloque.anio)
+                continue
+            valores = extraer_campos(page, tiempo_espera)
+            if not valores:
+                logger.warning("CUIT %s: no se pudo extraer nada de %s/%s", bloque.cuit, MESES[mes - 1], bloque.anio)
+                continue
+            escribir_valores(ws, bloque, mes, valores)
+            guardar_cb()
+            logger.info("CUIT %s: %s/%s completado (%d campos)",
+                        bloque.cuit, MESES[mes - 1], bloque.anio, len(valores))
+        except Exception:
+            logger.exception("Error procesando CUIT %s, mes %s/%s", bloque.cuit, mes, bloque.anio)
+
+
+# --------------------------------------------------------------------------
+# Planilla de ejemplo (para probar la logica de Excel sin tocar datos reales)
+# --------------------------------------------------------------------------
+
+def construir_planilla_demo(ruta: Path) -> None:
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    ws = wb.create_sheet(HOJA_CLIENTES)
+    ws["E2"], ws["F2"], ws["G2"], ws["H2"] = "DDJJ HECHA", "COMPLETOS", "NO ESTA CERRADO", "NO HECHOS"
+    ws["A3"], ws["D3"] = "INGRESOS BRUTOS 2024", "INGRESOS BRUTOS 2025"
+
+    datos_2024 = [("DIA 1", None), ("Cliente Ejemplo Uno", 20111111112),
+                  ("Cliente Ejemplo Dos", 20222222223), ("DIA 2", None),
+                  ("Cliente Ejemplo Tres", 20333333334)]
+    datos_2025 = [("DIA 1", None), ("Cliente Ejemplo Uno", 20111111112),
+                  ("Cliente Nuevo 2025", 20444444445)]
+
+    for i, (nombre, cuit) in enumerate(datos_2024, start=4):
+        ws.cell(row=i, column=1, value=nombre)
+        if cuit:
+            ws.cell(row=i, column=2, value=cuit)
+    for i, (nombre, cuit) in enumerate(datos_2025, start=4):
+        ws.cell(row=i, column=4, value=nombre)
+        if cuit:
+            ws.cell(row=i, column=5, value=cuit)
+
+    ws_dia1 = wb.create_sheet("DIA 1")
+    fila = _escribir_bloque_vacio(ws_dia1, 1, "Cliente Ejemplo Uno", 20111111112, "clave-demo-1")
+    for col in range(2, 8):  # enero..junio ya cargados -> deberian salir como "hechos"
+        ws_dia1.cell(row=2, column=col, value=1000.0 * col)
+        ws_dia1.cell(row=13, column=col, value=50.0 * col)
+    _escribir_bloque_vacio(ws_dia1, fila, "Cliente Ejemplo Dos", 20222222223, "clave-demo-2")
+
+    ws_dia2 = wb.create_sheet("DIA 2")
+    _escribir_bloque_vacio(ws_dia2, 1, "Cliente Ejemplo Tres", 20333333334, "clave-demo-3")
+
+    wb.create_sheet("DETALLE")
+    wb.save(ruta)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def construir_argumentos() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--excel", type=Path, help="Ruta al archivo .xlsx real")
+    parser.add_argument("--crear-demo", action="store_true", help="Genera demo.xlsx de ejemplo y termina")
+    parser.add_argument("--dry-run", action="store_true", help="Solo analiza la planilla, no abre el navegador")
+    parser.add_argument("--anios", default="2024,2025", help="Anios a procesar, ej: 2024,2025")
+    parser.add_argument("--cuit", type=int, help="Procesar un unico CUIT (para probar)")
+    parser.add_argument("--max-clientes", type=int, help="Limite de clientes a procesar en esta corrida")
+    parser.add_argument("--sin-headless", action="store_true", help="Muestra el navegador (recomendado al probar)")
+    parser.add_argument("--password", help="Contrasena a usar junto con --cuit si la celda todavia esta vacia")
+    parser.add_argument("--timeout", type=int, default=15000, help="Timeout de Playwright en ms (default 15000)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(f"iibb_agip_{datetime.now():%Y%m%d_%H%M%S}.log", encoding="utf-8"),
+        ],
+    )
+
+    args = construir_argumentos()
+
+    if args.crear_demo:
+        ruta_demo = Path("demo.xlsx")
+        construir_planilla_demo(ruta_demo)
+        logger.info("Planilla de ejemplo creada en %s", ruta_demo.resolve())
+        return
+
+    if not args.excel:
+        logger.error("Falta --excel <archivo.xlsx> (o --crear-demo para probar la logica sin datos reales)")
+        sys.exit(1)
+
+    ruta = args.excel
+    respaldo = ruta.with_name(ruta.stem + ".backup" + ruta.suffix)
+    if not respaldo.exists():
+        shutil.copy2(ruta, respaldo)
+        logger.info("Backup creado en %s", respaldo)
+
+    wb = load_workbook(ruta)
+    padron = leer_padron(wb)
+    indice = indexar_workbook(wb)
+
+    sin_password = crear_hojas_2025(wb, padron, indice)
+    if sin_password:
+        logger.warning("%d cliente(s) de 2025 sin contrasena conocida (completar a mano en el Excel):",
+                        len(sin_password))
+        for nombre, cuit, hoja, fila in sin_password:
+            logger.warning("  - %s (CUIT %s) en %r, fila %s", nombre, cuit, hoja, fila)
+
+    guardar_workbook(wb, ruta)
+    indice = indexar_workbook(wb)  # re-indexa incluyendo las hojas 2025 recien creadas
+
+    anios = {int(a) for a in args.anios.split(",")}
+    trabajo = []
+    for (anio, cuit), bloque in indice.items():
+        if anio not in anios:
+            continue
+        if args.cuit and cuit != args.cuit:
+            continue
+        ws = wb[bloque.hoja]
+        pendientes = meses_pendientes(ws, bloque)
+        if not pendientes:
+            continue
+        password = bloque.password or (args.password if args.cuit == cuit else None)
+        if not password:
+            logger.warning("Salteo CUIT %s (%s, %s): no tengo contrasena", cuit, bloque.nombre, anio)
+            continue
+        trabajo.append((bloque, ws, pendientes, password))
+
+    logger.info("Clientes con meses pendientes: %d", len(trabajo))
+    if args.dry_run:
+        for bloque, _, pendientes, _ in trabajo:
+            meses_txt = ", ".join(MESES[m - 1] for m in pendientes)
+            logger.info("  %s (CUIT %s, %s): %s", bloque.nombre, bloque.cuit, bloque.anio, meses_txt)
+        return
+
+    if args.max_clientes:
+        trabajo = trabajo[: args.max_clientes]
+
+    sync_playwright = _importar_playwright()
+    with sync_playwright() as pw:
+        navegador = pw.chromium.launch(headless=not args.sin_headless)
+        try:
+            for bloque, ws, pendientes, password in trabajo:
+                bloque.password = password
+                contexto = navegador.new_context()
+                pagina = contexto.new_page()
+                try:
+                    procesar_cliente(pagina, ws, bloque, pendientes, args.timeout,
+                                      guardar_cb=lambda: guardar_workbook(wb, ruta))
+                finally:
+                    contexto.close()
+                time.sleep(PAUSA_ENTRE_CLIENTES)
+        finally:
+            guardar_workbook(wb, ruta)
+            navegador.close()
+
+    logger.info("Listo. Planilla actualizada: %s", ruta.resolve())
+
+
+if __name__ == "__main__":
+    main()
