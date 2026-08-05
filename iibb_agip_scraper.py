@@ -8,10 +8,11 @@ Uso:
     python iibb_agip_scraper.py --excel "IIBB_ANUAL_2025.xlsx"
 
 Este archivo no contiene ninguna credencial. El usuario de AGIP es el
-CUIT/CUIL de cada cliente y la contrasena se lee en tiempo de ejecucion de
-la celda que esta al lado del CUIT en las hojas "DIA N" (y "DIA N - 2025",
-que el script genera solo la primera vez que corre). Si un cliente nuevo de
-2025 no tiene contrasena cargada todavia, se salta y se avisa por consola.
+CUIT/CUIL de cada cliente. La contrasena se resuelve asi, en orden: (1) si
+la celda al lado del CUIT en la hoja "DIA N" tiene algo escrito, se prueba
+primero, (2) si no funciona o no hay ninguna escrita, se prueban las
+contrasenas por defecto (CONTRASENAS_POR_DEFECTO, mas abajo). Un cliente
+solo se reporta como "fallido" si ninguna de las candidatas funciono.
 
 Limitacion conocida: el login y la extraccion de datos de AGIP estan
 escritos a partir de las instrucciones de la hoja DETALLE, sin haber podido
@@ -92,6 +93,11 @@ UBICACION_AGIP = {
 
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 PAUSA_ENTRE_CLIENTES = 1.5  # segundos, para no golpear el sitio sin pausa
+
+# La mayoria de los clientes no tiene contrasena propia escrita en el Excel:
+# usan una de estas dos por defecto. Si el bloque del cliente SI tiene una
+# contrasena explicita al lado del CUIT, esa se prueba primero.
+CONTRASENAS_POR_DEFECTO = ["magon130", "magon131"]
 
 logger = logging.getLogger("iibb_agip")
 
@@ -293,14 +299,12 @@ def _escribir_bloque_vacio(ws: Worksheet, fila_inicio: int, nombre: str,
 
 
 def crear_hojas_2025(wb, padron: Dict[int, List[Tuple[str, int, str]]],
-                      indice_2024: Dict[Tuple[int, int], BloqueCliente]
-                      ) -> List[Tuple[str, int, str, int]]:
+                      indice_2024: Dict[Tuple[int, int], BloqueCliente]) -> None:
     """Crea 'DIA N - 2025' para cada dia que aparezca en el padron 2025, con
-    un bloque vacio por cliente. Si el cliente ya existia en 2024, copia su
-    contrasena (se asume la misma clave ciudad). Es idempotente: si la hoja
-    ya existe, no la vuelve a crear. Devuelve la lista de clientes sin
-    contrasena conocida."""
-    sin_password: List[Tuple[str, int, str, int]] = []
+    un bloque vacio por cliente. Si el cliente ya existia en 2024 y tenia una
+    contrasena propia escrita, se copia (se prueba primero); si no, en el
+    login se usan las contrasenas por defecto. Es idempotente: si la hoja ya
+    existe, no la vuelve a crear."""
     dias = sorted({dia for _, _, dia in padron[2025]},
                   key=lambda d: int(re.search(r"\d+", d).group()))
 
@@ -318,13 +322,8 @@ def crear_hojas_2025(wb, padron: Dict[int, List[Tuple[str, int, str]]],
         for nombre, cuit in clientes:
             previo = indice_2024.get((2024, cuit))
             password = previo.password if previo else None
-            fila_cuit_prevista = fila + 1 + len(CONCEPTOS) + 1
             fila = _escribir_bloque_vacio(ws, fila, nombre, cuit, password)
-            if not password:
-                sin_password.append((nombre, cuit, nombre_hoja, fila_cuit_prevista))
         logger.info("Hoja %s creada con %d clientes", nombre_hoja, len(clientes))
-
-    return sin_password
 
 
 # --------------------------------------------------------------------------
@@ -385,12 +384,11 @@ def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
     return True
 
 
-def iniciar_sesion(page, cuit: int, password: str, tiempo_espera: int) -> bool:
-    """Entra a agip.gob.ar, hace click en 'Accede con Clave Ciudad' y
-    completa usuario (CUIT) / contrasena. El campo de contrasena se ubica
-    por type=password, que es un ancla confiable independientemente del
-    resto del markup; el de usuario se busca como el primer input de texto
-    dentro del mismo <form>."""
+def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
+    """Un unico intento de login con una contrasena puntual. El campo de
+    contrasena se ubica por type=password, que es un ancla confiable
+    independientemente del resto del markup; el de usuario se busca como
+    el primer input de texto dentro del mismo <form>."""
     page.goto(BASE_URL, wait_until="domcontentloaded")
 
     if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", tiempo_espera):
@@ -419,7 +417,23 @@ def iniciar_sesion(page, cuit: int, password: str, tiempo_espera: int) -> bool:
         page.wait_for_load_state("networkidle", timeout=tiempo_espera)
     except Exception:
         pass
-    return "agip.gob.ar" in page.url
+
+    # Si el login fallo, lo mas probable es que sigamos viendo el formulario
+    # (mismo campo de contrasena presente) o que no nos hayan redirigido de
+    # vuelta a agip.gob.ar.
+    sigue_en_login = page.locator('input[type="password"]').count() > 0
+    return ("agip.gob.ar" in page.url) and not sigue_en_login
+
+
+def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int) -> Optional[str]:
+    """Prueba cada contrasena candidata (la explicita del Excel, si la hay,
+    y despues las 2 por defecto) hasta que una funcione. Devuelve la
+    contrasena que funciono, o None si ninguna funciono."""
+    for i, password in enumerate(candidatas):
+        if _intentar_login(page, cuit, password, tiempo_espera):
+            return password
+        logger.info("CUIT %s: contrasena candidata %d/%d no funciono", cuit, i + 1, len(candidatas))
+    return None
 
 
 def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
@@ -519,12 +533,16 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, valores: Di
 
 
 def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: List[int],
-                      tiempo_espera: int, guardar_cb) -> None:
-    logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes",
-                bloque.nombre, bloque.cuit, bloque.anio, len(pendientes))
-    if not iniciar_sesion(page, bloque.cuit, bloque.password, tiempo_espera):
-        logger.error("No pude iniciar sesion para CUIT %s", bloque.cuit)
-        return
+                      candidatas: List[str], tiempo_espera: int, guardar_cb) -> bool:
+    """Devuelve True si logro iniciar sesion (con alguna de las candidatas),
+    False si ninguna contrasena funciono."""
+    logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes, %d contrasena(s) a probar",
+                bloque.nombre, bloque.cuit, bloque.anio, len(pendientes), len(candidatas))
+    password_ok = iniciar_sesion(page, bloque.cuit, candidatas, tiempo_espera)
+    if not password_ok:
+        logger.error("CUIT %s: ninguna contrasena funciono (probe %d)", bloque.cuit, len(candidatas))
+        return False
+    bloque.password = password_ok
 
     for mes in pendientes:
         try:
@@ -541,6 +559,8 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
                         bloque.cuit, MESES[mes - 1], bloque.anio, len(valores))
         except Exception:
             logger.exception("Error procesando CUIT %s, mes %s/%s", bloque.cuit, mes, bloque.anio)
+
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -584,11 +604,28 @@ def construir_planilla_demo(ruta: Path) -> None:
     wb.save(ruta)
 
 
+def candidatas_password(bloque: BloqueCliente, es_cuit_filtrado: bool,
+                         password_override: Optional[str]) -> List[str]:
+    """Orden de intento: la contrasena explicita del Excel (si la hay), el
+    --password de linea de comandos (solo si este cliente es el filtrado con
+    --cuit), y despues las 2 contrasenas por defecto."""
+    candidatas = []
+    if bloque.password:
+        candidatas.append(bloque.password)
+    if es_cuit_filtrado and password_override and password_override not in candidatas:
+        candidatas.append(password_override)
+    for p in CONTRASENAS_POR_DEFECTO:
+        if p not in candidatas:
+            candidatas.append(p)
+    return candidatas
+
+
 def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: set,
                       cuit_filtro: Optional[int], password_override: Optional[str]
-                      ) -> List[Tuple[BloqueCliente, Worksheet, List[int], str]]:
-    """Arma la lista de (bloque, hoja, meses_pendientes, password) a procesar,
-    salteando y avisando de los clientes sin contrasena conocida."""
+                      ) -> List[Tuple[BloqueCliente, Worksheet, List[int], List[str]]]:
+    """Arma la lista de (bloque, hoja, meses_pendientes, candidatas_password)
+    a procesar. Ya no salteamos por falta de contrasena explicita: se
+    prueban las contrasenas por defecto en el momento del login."""
     trabajo = []
     for (anio, cuit), bloque in indice.items():
         if anio not in anios:
@@ -599,12 +636,50 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
         pendientes = meses_pendientes(ws, bloque)
         if not pendientes:
             continue
-        password = bloque.password or (password_override if cuit_filtro == cuit else None)
-        if not password:
-            logger.warning("Salteo CUIT %s (%s, %s): no tengo contrasena", cuit, bloque.nombre, anio)
-            continue
-        trabajo.append((bloque, ws, pendientes, password))
+        candidatas = candidatas_password(bloque, cuit_filtro == cuit, password_override)
+        trabajo.append((bloque, ws, pendientes, candidatas))
     return trabajo
+
+
+def generar_resumen(wb, padron: Dict[int, List[Tuple[str, int, str]]],
+                     indice: Dict[Tuple[int, int], BloqueCliente]) -> None:
+    """Recorre TODO el padron (2024 y 2025, todos los clientes que figuran en
+    'Lista de Clientes - IIBB') y lo compara contra lo que hay indexado en
+    las hojas DIA-N, para reportar el estado real: completos, con meses
+    pendientes, o ni siquiera ubicados en ninguna hoja."""
+    completos: List[Tuple[int, str, int]] = []
+    pendientes: List[Tuple[int, str, int, List[int]]] = []
+    no_encontrados: List[Tuple[int, str, int, str]] = []
+
+    for anio in (2024, 2025):
+        for nombre, cuit, dia in padron.get(anio, []):
+            bloque = indice.get((anio, cuit))
+            if not bloque:
+                no_encontrados.append((anio, nombre, cuit, dia))
+                continue
+            ws = wb[bloque.hoja]
+            meses_falt = meses_pendientes(ws, bloque)
+            if meses_falt:
+                pendientes.append((anio, bloque.nombre, cuit, meses_falt))
+            else:
+                completos.append((anio, bloque.nombre, cuit))
+
+    total = len(completos) + len(pendientes) + len(no_encontrados)
+    logger.info("=" * 60)
+    logger.info("RESUMEN: %d clientes en el padron (2024 + 2025)", total)
+    logger.info("  Completos:            %d", len(completos))
+    logger.info("  Con meses pendientes: %d", len(pendientes))
+    logger.info("  No ubicados en hoja:  %d", len(no_encontrados))
+    if pendientes:
+        logger.info("--- Con meses pendientes ---")
+        for anio, nombre, cuit, meses in pendientes:
+            meses_txt = ", ".join(MESES[m - 1] for m in meses)
+            logger.info("  [%s] %s (CUIT %s): %s", anio, nombre, cuit, meses_txt)
+    if no_encontrados:
+        logger.info("--- No ubicados (revisar esa fila/bloque a mano) ---")
+        for anio, nombre, cuit, dia in no_encontrados:
+            logger.info("  [%s] %s (CUIT %s) - %s", anio, nombre, cuit, dia)
+    logger.info("=" * 60)
 
 
 # --------------------------------------------------------------------------
@@ -658,19 +733,7 @@ def main() -> None:
         wb = load_workbook(ruta)
         padron = leer_padron(wb)
         indice = indexar_workbook(wb)
-
-        if 2025 in anios:
-            ya_tienen_hoja = {cuit for (anio, cuit) in indice if anio == 2025}
-            faltan_hoja = [(n, c) for n, c, _ in padron[2025] if c not in ya_tienen_hoja]
-            if faltan_hoja:
-                logger.info("2025: %d cliente(s) todavia sin hoja generada "
-                            "(se crean solo, corriendo sin --dry-run)", len(faltan_hoja))
-
-        trabajo = calcular_trabajo(wb, indice, anios, args.cuit, args.password)
-        logger.info("Clientes con meses pendientes (sobre lo ya existente en el archivo): %d", len(trabajo))
-        for bloque, _, pendientes, _ in trabajo:
-            meses_txt = ", ".join(MESES[m - 1] for m in pendientes)
-            logger.info("  %s (CUIT %s, %s): %s", bloque.nombre, bloque.cuit, bloque.anio, meses_txt)
+        generar_resumen(wb, padron, indice)
         return
 
     respaldo = ruta.with_name(ruta.stem + ".backup" + ruta.suffix)
@@ -682,13 +745,7 @@ def main() -> None:
     padron = leer_padron(wb)
     indice = indexar_workbook(wb)
 
-    sin_password = crear_hojas_2025(wb, padron, indice)
-    if sin_password:
-        logger.warning("%d cliente(s) de 2025 sin contrasena conocida (completar a mano en el Excel):",
-                        len(sin_password))
-        for nombre, cuit, hoja, fila in sin_password:
-            logger.warning("  - %s (CUIT %s) en %r, fila %s", nombre, cuit, hoja, fila)
-
+    crear_hojas_2025(wb, padron, indice)
     guardar_workbook(wb, ruta)
     indice = indexar_workbook(wb)  # re-indexa incluyendo las hojas 2025 recien creadas
 
@@ -698,17 +755,19 @@ def main() -> None:
     if args.max_clientes:
         trabajo = trabajo[: args.max_clientes]
 
+    fallos_login: List[Tuple[int, str, int]] = []
     sync_playwright = _importar_playwright()
     with sync_playwright() as pw:
         navegador = pw.chromium.launch(headless=not args.sin_headless)
         try:
-            for bloque, ws, pendientes, password in trabajo:
-                bloque.password = password
+            for bloque, ws, pendientes, candidatas in trabajo:
                 contexto = navegador.new_context()
                 pagina = contexto.new_page()
                 try:
-                    procesar_cliente(pagina, ws, bloque, pendientes, args.timeout,
-                                      guardar_cb=lambda: guardar_workbook(wb, ruta))
+                    ok = procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
+                                           guardar_cb=lambda: guardar_workbook(wb, ruta))
+                    if not ok:
+                        fallos_login.append((bloque.anio, bloque.nombre, bloque.cuit))
                 finally:
                     contexto.close()
                 time.sleep(PAUSA_ENTRE_CLIENTES)
@@ -716,7 +775,15 @@ def main() -> None:
             guardar_workbook(wb, ruta)
             navegador.close()
 
+    if fallos_login:
+        logger.warning("%d cliente(s) no se pudieron loguear con ninguna contrasena probada:",
+                        len(fallos_login))
+        for anio, nombre, cuit in fallos_login:
+            logger.warning("  [%s] %s (CUIT %s)", anio, nombre, cuit)
+
     logger.info("Listo. Planilla actualizada: %s", ruta.resolve())
+    indice_final = indexar_workbook(wb)
+    generar_resumen(wb, padron, indice_final)
 
 
 if __name__ == "__main__":
