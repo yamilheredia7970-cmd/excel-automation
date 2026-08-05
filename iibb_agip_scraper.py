@@ -584,6 +584,29 @@ def construir_planilla_demo(ruta: Path) -> None:
     wb.save(ruta)
 
 
+def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: set,
+                      cuit_filtro: Optional[int], password_override: Optional[str]
+                      ) -> List[Tuple[BloqueCliente, Worksheet, List[int], str]]:
+    """Arma la lista de (bloque, hoja, meses_pendientes, password) a procesar,
+    salteando y avisando de los clientes sin contrasena conocida."""
+    trabajo = []
+    for (anio, cuit), bloque in indice.items():
+        if anio not in anios:
+            continue
+        if cuit_filtro and cuit != cuit_filtro:
+            continue
+        ws = wb[bloque.hoja]
+        pendientes = meses_pendientes(ws, bloque)
+        if not pendientes:
+            continue
+        password = bloque.password or (password_override if cuit_filtro == cuit else None)
+        if not password:
+            logger.warning("Salteo CUIT %s (%s, %s): no tengo contrasena", cuit, bloque.nombre, anio)
+            continue
+        trabajo.append((bloque, ws, pendientes, password))
+    return trabajo
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -626,6 +649,30 @@ def main() -> None:
         sys.exit(1)
 
     ruta = args.excel
+    anios = {int(a) for a in args.anios.split(",")}
+
+    if args.dry_run:
+        # Modo de solo lectura: no crea backup, no crea hojas 2025, no guarda
+        # nada. Es seguro correrlo directo sobre el archivo real.
+        logger.info("Modo --dry-run: no se modifica ni se guarda el archivo.")
+        wb = load_workbook(ruta)
+        padron = leer_padron(wb)
+        indice = indexar_workbook(wb)
+
+        if 2025 in anios:
+            ya_tienen_hoja = {cuit for (anio, cuit) in indice if anio == 2025}
+            faltan_hoja = [(n, c) for n, c, _ in padron[2025] if c not in ya_tienen_hoja]
+            if faltan_hoja:
+                logger.info("2025: %d cliente(s) todavia sin hoja generada "
+                            "(se crean solo, corriendo sin --dry-run)", len(faltan_hoja))
+
+        trabajo = calcular_trabajo(wb, indice, anios, args.cuit, args.password)
+        logger.info("Clientes con meses pendientes (sobre lo ya existente en el archivo): %d", len(trabajo))
+        for bloque, _, pendientes, _ in trabajo:
+            meses_txt = ", ".join(MESES[m - 1] for m in pendientes)
+            logger.info("  %s (CUIT %s, %s): %s", bloque.nombre, bloque.cuit, bloque.anio, meses_txt)
+        return
+
     respaldo = ruta.with_name(ruta.stem + ".backup" + ruta.suffix)
     if not respaldo.exists():
         shutil.copy2(ruta, respaldo)
@@ -645,29 +692,8 @@ def main() -> None:
     guardar_workbook(wb, ruta)
     indice = indexar_workbook(wb)  # re-indexa incluyendo las hojas 2025 recien creadas
 
-    anios = {int(a) for a in args.anios.split(",")}
-    trabajo = []
-    for (anio, cuit), bloque in indice.items():
-        if anio not in anios:
-            continue
-        if args.cuit and cuit != args.cuit:
-            continue
-        ws = wb[bloque.hoja]
-        pendientes = meses_pendientes(ws, bloque)
-        if not pendientes:
-            continue
-        password = bloque.password or (args.password if args.cuit == cuit else None)
-        if not password:
-            logger.warning("Salteo CUIT %s (%s, %s): no tengo contrasena", cuit, bloque.nombre, anio)
-            continue
-        trabajo.append((bloque, ws, pendientes, password))
-
+    trabajo = calcular_trabajo(wb, indice, anios, args.cuit, args.password)
     logger.info("Clientes con meses pendientes: %d", len(trabajo))
-    if args.dry_run:
-        for bloque, _, pendientes, _ in trabajo:
-            meses_txt = ", ".join(MESES[m - 1] for m in pendientes)
-            logger.info("  %s (CUIT %s, %s): %s", bloque.nombre, bloque.cuit, bloque.anio, meses_txt)
-        return
 
     if args.max_clientes:
         trabajo = trabajo[: args.max_clientes]
