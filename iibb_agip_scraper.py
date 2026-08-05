@@ -94,6 +94,13 @@ UBICACION_AGIP = {
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 PAUSA_ENTRE_CLIENTES = 1.5  # segundos, para no golpear el sitio sin pausa
 
+# Margen extra despues de cada click/navegacion, ademas de las esperas de
+# Playwright. Sitios como AGIP a veces reportan la pagina como "cargada"
+# un instante antes de que el contenido nuevo este realmente listo; un
+# respiro fijo aca evita leer/clickear en el medio de esa transicion.
+# Configurable con --pausa-accion.
+PAUSA_ACCION = 2.0
+
 # La mayoria de los clientes no tiene contrasena propia escrita en el Excel:
 # usan una de estas dos por defecto. Si el bloque del cliente SI tiene una
 # contrasena explicita al lado del CUIT, esa se prueba primero.
@@ -374,6 +381,12 @@ def _importar_playwright():
     return sync_playwright
 
 
+def pausar(segundos: Optional[float] = None) -> None:
+    """Espera fija ademas de las esperas automaticas de Playwright. Ver
+    PAUSA_ACCION / --pausa-accion."""
+    time.sleep(PAUSA_ACCION if segundos is None else segundos)
+
+
 def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
     """Intenta clickear un elemento por texto. Devuelve False tanto si no
     aparecio como si el click en si fallo (elemento tapado, se desprendio
@@ -383,6 +396,7 @@ def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
     try:
         loc.wait_for(state="visible", timeout=tiempo)
         loc.click(timeout=tiempo)
+        pausar()
         return True
     except Exception:
         return False
@@ -399,6 +413,7 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
     confirmar con un segundo click (mismo boton, o uno de tipo
     ingresar/continuar) antes de que aparezca el campo de contrasena."""
     page.goto(BASE_URL, wait_until="domcontentloaded")
+    pausar()
 
     if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", tiempo_espera):
         logger.error("No encontre el enlace 'Accede con Clave Ciudad' en %s", BASE_URL)
@@ -438,6 +453,7 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
         page.wait_for_load_state("networkidle", timeout=tiempo_espera)
     except Exception:
         pass
+    pausar()
 
     # Si el login fallo, lo mas probable es que sigamos viendo el formulario
     # (mismo campo de contrasena presente) o que no nos hayan redirigido de
@@ -719,6 +735,8 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--sin-headless", action="store_true", help="Muestra el navegador (recomendado al probar)")
     parser.add_argument("--password", help="Contrasena a usar junto con --cuit si la celda todavia esta vacia")
     parser.add_argument("--timeout", type=int, default=15000, help="Timeout de Playwright en ms (default 15000)")
+    parser.add_argument("--pausa-accion", type=float, default=PAUSA_ACCION,
+                         help=f"Segundos de espera fija tras cada click/navegacion (default {PAUSA_ACCION})")
     return parser.parse_args()
 
 
@@ -733,6 +751,9 @@ def main() -> None:
     )
 
     args = construir_argumentos()
+
+    global PAUSA_ACCION
+    PAUSA_ACCION = args.pausa_accion
 
     if args.crear_demo:
         ruta_demo = Path("demo.xlsx")
