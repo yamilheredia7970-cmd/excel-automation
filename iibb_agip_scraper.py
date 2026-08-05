@@ -375,20 +375,29 @@ def _importar_playwright():
 
 
 def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
+    """Intenta clickear un elemento por texto. Devuelve False tanto si no
+    aparecio como si el click en si fallo (elemento tapado, se desprendio
+    del DOM, etc.) -- nunca deja escapar la excepcion, para que un boton
+    inesperado no tire abajo el procesamiento de todo un cliente."""
     loc = page.get_by_text(re.compile(patron_texto, re.I)).first
     try:
         loc.wait_for(state="visible", timeout=tiempo)
+        loc.click(timeout=tiempo)
+        return True
     except Exception:
         return False
-    loc.click()
-    return True
 
 
 def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
     """Un unico intento de login con una contrasena puntual. El campo de
     contrasena se ubica por type=password, que es un ancla confiable
     independientemente del resto del markup; el de usuario se busca como
-    el primer input de texto dentro del mismo <form>."""
+    el primer input de texto dentro del mismo <form>.
+
+    En el sitio real, el primer click en 'Accede con Clave Ciudad' no
+    siempre redirige directo al formulario de login: a veces hay que
+    confirmar con un segundo click (mismo boton, o uno de tipo
+    ingresar/continuar) antes de que aparezca el campo de contrasena."""
     page.goto(BASE_URL, wait_until="domcontentloaded")
 
     if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", tiempo_espera):
@@ -396,11 +405,23 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
         return False
 
     campo_password = page.locator('input[type="password"]').first
+    tiene_campo_password = False
     try:
-        campo_password.wait_for(state="visible", timeout=tiempo_espera)
+        campo_password.wait_for(state="visible", timeout=3000)
+        tiene_campo_password = True
     except Exception:
-        logger.error("No aparecio el campo de contrasena tras entrar a Clave Ciudad")
-        return False
+        tiene_campo_password = False
+
+    if not tiene_campo_password:
+        # Segundo click: probamos el mismo texto de nuevo, y si no esta mas
+        # (porque cambio de pantalla), un boton generico de confirmacion.
+        if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", 3000):
+            _click_si_existe(page, r"ingresar|continuar|confirmar", 3000)
+        try:
+            campo_password.wait_for(state="visible", timeout=tiempo_espera)
+        except Exception:
+            logger.error("No aparecio el campo de contrasena ni despues de un segundo click")
+            return False
 
     formulario = campo_password.locator("xpath=ancestor::form[1]")
     campo_usuario = formulario.locator('input[type="text"], input[type="tel"], input:not([type])').first
@@ -768,6 +789,9 @@ def main() -> None:
                                            guardar_cb=lambda: guardar_workbook(wb, ruta))
                     if not ok:
                         fallos_login.append((bloque.anio, bloque.nombre, bloque.cuit))
+                except Exception:
+                    logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
+                    fallos_login.append((bloque.anio, bloque.nombre, bloque.cuit))
                 finally:
                     contexto.close()
                 time.sleep(PAUSA_ENTRE_CLIENTES)
