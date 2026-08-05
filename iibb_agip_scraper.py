@@ -402,75 +402,99 @@ def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
         return False
 
 
-def _intentar_login(page, cuit: int, password: str, tiempo_espera: int) -> bool:
-    """Un unico intento de login con una contrasena puntual. El campo de
-    contrasena se ubica por type=password, que es un ancla confiable
-    independientemente del resto del markup; el de usuario se busca como
-    el primer input de texto dentro del mismo <form>.
+# El enlace 'Clave Ciudad' de la home de AGIP abre claveciudad.agip.gob.ar
+# en una PESTANA NUEVA (target=_blank). En esa pestana nueva hay OTRO
+# enlace, tambien de texto 'Clave Ciudad' pero con onclick="toggleLogin()",
+# que recien ahi despliega el formulario de usuario/contrasena. Selectores
+# tomados del HTML real de la pagina (no son una adivinanza por texto).
+SELECTOR_LINK_CLAVE_CIUDAD = 'a[href="https://claveciudad.agip.gob.ar/"]'
+SELECTOR_LINK_TOGGLE_LOGIN = 'a[onclick*="toggleLogin"]'
 
-    En el sitio real, el primer click en 'Accede con Clave Ciudad' no
-    siempre redirige directo al formulario de login: a veces hay que
-    confirmar con un segundo click (mismo boton, o uno de tipo
-    ingresar/continuar) antes de que aparezca el campo de contrasena."""
+
+def _intentar_login(page, cuit: int, password: str, tiempo_espera: int):
+    """Un unico intento de login con una contrasena puntual. Devuelve la
+    pagina donde quedo la sesion activa (la pestana nueva que abre Clave
+    Ciudad) si el login funciono, o None si fallo en cualquier paso."""
     page.goto(BASE_URL, wait_until="domcontentloaded")
     pausar()
 
-    if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", tiempo_espera):
-        logger.error("No encontre el enlace 'Accede con Clave Ciudad' en %s", BASE_URL)
-        return False
-
-    campo_password = page.locator('input[type="password"]').first
-    tiene_campo_password = False
     try:
-        campo_password.wait_for(state="visible", timeout=3000)
-        tiene_campo_password = True
+        with page.expect_popup(timeout=tiempo_espera) as popup_info:
+            enlace = page.locator(SELECTOR_LINK_CLAVE_CIUDAD).first
+            enlace.wait_for(state="visible", timeout=tiempo_espera)
+            enlace.click()
+        nueva_pagina = popup_info.value
     except Exception:
-        tiene_campo_password = False
+        logger.error("No se abrio la pestana de Clave Ciudad (%s) en %s",
+                      SELECTOR_LINK_CLAVE_CIUDAD, BASE_URL)
+        return None
 
-    if not tiene_campo_password:
-        # Segundo click: probamos el mismo texto de nuevo, y si no esta mas
-        # (porque cambio de pantalla), un boton generico de confirmacion.
-        if not _click_si_existe(page, r"accede\s+con\s+clave\s+ciudad", 3000):
-            _click_si_existe(page, r"ingresar|continuar|confirmar", 3000)
-        try:
-            campo_password.wait_for(state="visible", timeout=tiempo_espera)
-        except Exception:
-            logger.error("No aparecio el campo de contrasena ni despues de un segundo click")
-            return False
+    try:
+        nueva_pagina.wait_for_load_state("domcontentloaded", timeout=tiempo_espera)
+    except Exception:
+        pass
+    pausar()
 
+    try:
+        toggle = nueva_pagina.locator(SELECTOR_LINK_TOGGLE_LOGIN).first
+        toggle.wait_for(state="visible", timeout=tiempo_espera)
+        toggle.click()
+        pausar()
+    except Exception:
+        logger.error("No encontre el segundo enlace Clave Ciudad (%s) en la pestana nueva",
+                      SELECTOR_LINK_TOGGLE_LOGIN)
+        nueva_pagina.close()
+        return None
+
+    campo_password = nueva_pagina.locator('input[type="password"]').first
+    try:
+        campo_password.wait_for(state="visible", timeout=tiempo_espera)
+    except Exception:
+        logger.error("No aparecio el campo de contrasena tras el segundo click (toggleLogin)")
+        nueva_pagina.close()
+        return None
+
+    # El campo de usuario se busca dentro del mismo <form> si existe; si el
+    # formulario revelado por toggleLogin no usa <form>, buscamos en toda
+    # la pestana como respaldo.
     formulario = campo_password.locator("xpath=ancestor::form[1]")
-    campo_usuario = formulario.locator('input[type="text"], input[type="tel"], input:not([type])').first
+    contenedor = formulario if formulario.count() > 0 else nueva_pagina
+    campo_usuario = contenedor.locator('input[type="text"], input[type="tel"], input:not([type])').first
     campo_usuario.fill(str(cuit))
     campo_password.fill(password)
 
-    boton = formulario.get_by_role("button", name=re.compile(r"ingresar|entrar|iniciar", re.I))
+    boton = contenedor.get_by_role("button", name=re.compile(r"ingresar|entrar|iniciar", re.I))
     if boton.count() > 0:
         boton.first.click()
     else:
         campo_password.press("Enter")
 
     try:
-        page.wait_for_load_state("networkidle", timeout=tiempo_espera)
+        nueva_pagina.wait_for_load_state("networkidle", timeout=tiempo_espera)
     except Exception:
         pass
     pausar()
 
-    # Si el login fallo, lo mas probable es que sigamos viendo el formulario
-    # (mismo campo de contrasena presente) o que no nos hayan redirigido de
-    # vuelta a agip.gob.ar.
-    sigue_en_login = page.locator('input[type="password"]').count() > 0
-    return ("agip.gob.ar" in page.url) and not sigue_en_login
+    # Si el login fallo, lo mas probable es que sigamos viendo el mismo
+    # campo de contrasena (formulario no avanzo).
+    sigue_en_login = nueva_pagina.locator('input[type="password"]').count() > 0
+    if sigue_en_login:
+        return None
+    return nueva_pagina
 
 
-def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int) -> Optional[str]:
+def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int):
     """Prueba cada contrasena candidata (la explicita del Excel, si la hay,
-    y despues las 2 por defecto) hasta que una funcione. Devuelve la
-    contrasena que funciono, o None si ninguna funciono."""
+    y despues las 2 por defecto) hasta que una funcione. Devuelve
+    (password_que_funciono, pagina_activa), o (None, None) si ninguna
+    funciono. pagina_activa puede ser distinta de 'page': Clave Ciudad abre
+    en una pestana nueva, y ahi es donde sigue el resto de la sesion."""
     for i, password in enumerate(candidatas):
-        if _intentar_login(page, cuit, password, tiempo_espera):
-            return password
+        pagina_activa = _intentar_login(page, cuit, password, tiempo_espera)
+        if pagina_activa:
+            return password, pagina_activa
         logger.info("CUIT %s: contrasena candidata %d/%d no funciono", cuit, i + 1, len(candidatas))
-    return None
+    return None, None
 
 
 def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
@@ -575,7 +599,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
     False si ninguna contrasena funciono."""
     logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes, %d contrasena(s) a probar",
                 bloque.nombre, bloque.cuit, bloque.anio, len(pendientes), len(candidatas))
-    password_ok = iniciar_sesion(page, bloque.cuit, candidatas, tiempo_espera)
+    password_ok, pagina_activa = iniciar_sesion(page, bloque.cuit, candidatas, tiempo_espera)
     if not password_ok:
         logger.error("CUIT %s: ninguna contrasena funciono (probe %d)", bloque.cuit, len(candidatas))
         return False
@@ -583,10 +607,10 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
 
     for mes in pendientes:
         try:
-            if not ir_a_declaracion(page, bloque.anio, mes, tiempo_espera):
+            if not ir_a_declaracion(pagina_activa, bloque.anio, mes, tiempo_espera):
                 logger.warning("CUIT %s: no encontre la DDJJ de %s/%s", bloque.cuit, MESES[mes - 1], bloque.anio)
                 continue
-            valores = extraer_campos(page, tiempo_espera)
+            valores = extraer_campos(pagina_activa, tiempo_espera)
             if not valores:
                 logger.warning("CUIT %s: no se pudo extraer nada de %s/%s", bloque.cuit, MESES[mes - 1], bloque.anio)
                 continue
