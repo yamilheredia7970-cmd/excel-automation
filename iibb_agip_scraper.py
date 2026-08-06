@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import re
 import shutil
 import sys
@@ -92,14 +93,15 @@ UBICACION_AGIP = {
 # para "anticipo determinado", es el primer lugar donde hay que mirar.
 
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
-PAUSA_ENTRE_CLIENTES = 1.5  # segundos, para no golpear el sitio sin pausa
 
-# Margen extra despues de cada click/navegacion, ademas de las esperas de
-# Playwright. Sitios como AGIP a veces reportan la pagina como "cargada"
-# un instante antes de que el contenido nuevo este realmente listo; un
-# respiro fijo aca evita leer/clickear en el medio de esa transicion.
-# Configurable con --pausa-accion.
-PAUSA_ACCION = 2.0
+# Pausas con variacion aleatoria (jitter): un tiempo fijo identico en cada
+# paso es, en si mismo, una firma de script. +/- el jitter de por medio
+# para que el ritmo no sea perfectamente uniforme. Configurables por CLI
+# (--pausa-accion / --pausa-clientes) sin tocar codigo.
+PAUSA_ACCION = 2.0            # despues de cada click/navegacion
+PAUSA_ACCION_JITTER = 0.7
+PAUSA_ENTRE_CLIENTES = 4.0    # entre el cierre de un cliente y el login del siguiente
+PAUSA_ENTRE_CLIENTES_JITTER = 2.0
 
 # La mayoria de los clientes no tiene contrasena propia escrita en el Excel:
 # usan una de estas dos por defecto. Si el bloque del cliente SI tiene una
@@ -381,10 +383,19 @@ def _importar_playwright():
     return sync_playwright
 
 
-def pausar(segundos: Optional[float] = None) -> None:
-    """Espera fija ademas de las esperas automaticas de Playwright. Ver
-    PAUSA_ACCION / --pausa-accion."""
-    time.sleep(PAUSA_ACCION if segundos is None else segundos)
+def pausar(base: Optional[float] = None, jitter: Optional[float] = None) -> None:
+    """Espera ademas de las esperas automaticas de Playwright, con una
+    variacion aleatoria +/- jitter para que el ritmo no sea perfectamente
+    uniforme entre paso y paso. Ver PAUSA_ACCION / --pausa-accion."""
+    base = PAUSA_ACCION if base is None else base
+    jitter = PAUSA_ACCION_JITTER if jitter is None else jitter
+    time.sleep(max(0.1, base + random.uniform(-jitter, jitter)))
+
+
+def pausar_entre_clientes() -> None:
+    """Espera mas larga entre el cierre de la sesion de un cliente y el
+    login del siguiente. Ver PAUSA_ENTRE_CLIENTES / --pausa-clientes."""
+    pausar(PAUSA_ENTRE_CLIENTES, PAUSA_ENTRE_CLIENTES_JITTER)
 
 
 def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
@@ -460,8 +471,14 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int):
     formulario = campo_password.locator("xpath=ancestor::form[1]")
     contenedor = formulario if formulario.count() > 0 else nueva_pagina
     campo_usuario = contenedor.locator('input[type="text"], input[type="tel"], input:not([type])').first
+    campo_usuario.click()
+    pausar(0.6, 0.4)
     campo_usuario.fill(str(cuit))
+    pausar(0.8, 0.5)
+    campo_password.click()
+    pausar(0.5, 0.3)
     campo_password.fill(password)
+    pausar(0.9, 0.5)
 
     boton = contenedor.get_by_role("button", name=re.compile(r"ingresar|entrar|iniciar", re.I))
     if boton.count() > 0:
@@ -760,7 +777,9 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--password", help="Contrasena a usar junto con --cuit si la celda todavia esta vacia")
     parser.add_argument("--timeout", type=int, default=15000, help="Timeout de Playwright en ms (default 15000)")
     parser.add_argument("--pausa-accion", type=float, default=PAUSA_ACCION,
-                         help=f"Segundos de espera fija tras cada click/navegacion (default {PAUSA_ACCION})")
+                         help=f"Segundos de espera (promedio) tras cada click/navegacion (default {PAUSA_ACCION})")
+    parser.add_argument("--pausa-clientes", type=float, default=PAUSA_ENTRE_CLIENTES,
+                         help=f"Segundos de espera (promedio) entre cliente y cliente (default {PAUSA_ENTRE_CLIENTES})")
     return parser.parse_args()
 
 
@@ -776,8 +795,9 @@ def main() -> None:
 
     args = construir_argumentos()
 
-    global PAUSA_ACCION
+    global PAUSA_ACCION, PAUSA_ENTRE_CLIENTES
     PAUSA_ACCION = args.pausa_accion
+    PAUSA_ENTRE_CLIENTES = args.pausa_clientes
 
     if args.crear_demo:
         ruta_demo = Path("demo.xlsx")
@@ -839,7 +859,7 @@ def main() -> None:
                     fallos_login.append((bloque.anio, bloque.nombre, bloque.cuit))
                 finally:
                     contexto.close()
-                time.sleep(PAUSA_ENTRE_CLIENTES)
+                pausar_entre_clientes()
         finally:
             guardar_workbook(wb, ruta)
             navegador.close()
