@@ -360,10 +360,29 @@ def meses_pendientes(ws: Worksheet, bloque: BloqueCliente) -> List[int]:
 # Guardado seguro
 # --------------------------------------------------------------------------
 
-def guardar_workbook(wb, ruta: Path) -> None:
+def guardar_workbook(wb, ruta: Path, intentos: int = 5, espera: float = 2.0) -> None:
+    """Guarda de forma atomica (escribe a un .tmp y reemplaza). En Windows,
+    si el Excel esta abierto en otro programa (Excel, OneDrive
+    sincronizando, etc.) el reemplazo falla con PermissionError; en vez de
+    cortar toda la corrida, reintenta unas veces antes de rendirse."""
     tmp = ruta.with_suffix(f".tmp{ruta.suffix}")
     wb.save(tmp)
-    tmp.replace(ruta)
+    for intento in range(1, intentos + 1):
+        try:
+            tmp.replace(ruta)
+            return
+        except PermissionError:
+            if intento == intentos:
+                tmp.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"No pude guardar '{ruta.name}': el archivo parece estar abierto en otro "
+                    "programa (Excel, OneDrive sincronizando, etc). Cerralo y volve a correr "
+                    "el script."
+                ) from None
+            logger.warning("'%s' esta bloqueado para escritura (intento %d/%d) -- "
+                            "¿esta abierto en Excel? Reintento en %.0fs.",
+                            ruta.name, intento, intentos, espera)
+            time.sleep(espera)
 
 
 # --------------------------------------------------------------------------
