@@ -98,8 +98,8 @@ UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 # paso es, en si mismo, una firma de script. +/- el jitter de por medio
 # para que el ritmo no sea perfectamente uniforme. Configurables por CLI
 # (--pausa-accion / --pausa-clientes) sin tocar codigo.
-PAUSA_ACCION = 2.0            # despues de cada click/navegacion
-PAUSA_ACCION_JITTER = 0.7
+PAUSA_ACCION = 1.0            # despues de cada click/navegacion
+PAUSA_ACCION_JITTER = 0.4
 PAUSA_ENTRE_CLIENTES = 4.0    # entre el cierre de un cliente y el login del siguiente
 PAUSA_ENTRE_CLIENTES_JITTER = 2.0
 
@@ -472,13 +472,13 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int):
     contenedor = formulario if formulario.count() > 0 else nueva_pagina
     campo_usuario = contenedor.locator('input[type="text"], input[type="tel"], input:not([type])').first
     campo_usuario.click()
-    pausar(0.6, 0.4)
+    pausar(0.3, 0.2)
     campo_usuario.fill(str(cuit))
-    pausar(0.8, 0.5)
+    pausar(0.4, 0.25)
     campo_password.click()
-    pausar(0.5, 0.3)
+    pausar(0.25, 0.15)
     campo_password.fill(password)
-    pausar(0.9, 0.5)
+    pausar(0.45, 0.25)
 
     boton = contenedor.get_by_role("button", name=re.compile(r"ingresar|entrar|iniciar", re.I))
     if boton.count() > 0:
