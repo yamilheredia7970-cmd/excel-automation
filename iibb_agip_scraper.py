@@ -721,8 +721,9 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
                       cuit_filtro: Optional[int], password_override: Optional[str]
                       ) -> List[Tuple[BloqueCliente, Worksheet, List[int], List[str]]]:
     """Arma la lista de (bloque, hoja, meses_pendientes, candidatas_password)
-    a procesar. Ya no salteamos por falta de contrasena explicita: se
-    prueban las contrasenas por defecto en el momento del login."""
+    a procesar, ordenada por anio (todos los de 2024 antes que cualquiera
+    de 2025). Ya no salteamos por falta de contrasena explicita: se prueban
+    las contrasenas por defecto en el momento del login."""
     trabajo = []
     for (anio, cuit), bloque in indice.items():
         if anio not in anios:
@@ -735,6 +736,7 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
             continue
         candidatas = candidatas_password(bloque, cuit_filtro == cuit, password_override)
         trabajo.append((bloque, ws, pendientes, candidatas))
+    trabajo.sort(key=lambda item: item[0].anio)
     return trabajo
 
 
