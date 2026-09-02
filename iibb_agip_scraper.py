@@ -609,10 +609,10 @@ def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
         logger.warning("No encontre la fila de %s-%02d en la grilla de DDJJ", anio, mes_idx)
         return False
     try:
-        fila.click(timeout=tiempo_espera)
+        fila.dblclick(timeout=tiempo_espera)
         pausar()
     except Exception:
-        logger.error("Encontre la fila de %s-%02d pero no pude clickearla", anio, mes_idx)
+        logger.error("Encontre la fila de %s-%02d pero no pude hacerle doble click", anio, mes_idx)
         return False
     page.wait_for_load_state("networkidle", timeout=tiempo_espera)
     return True
