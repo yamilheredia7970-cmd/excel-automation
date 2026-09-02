@@ -533,8 +533,69 @@ def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int):
     return None, None
 
 
+def _texto_celda(locator_celda, tiempo: int) -> str:
+    try:
+        return locator_celda.locator(".x-grid-cell-inner").inner_text(timeout=tiempo).strip()
+    except Exception:
+        try:
+            return locator_celda.inner_text(timeout=tiempo).strip()
+        except Exception:
+            return ""
+
+
+def buscar_fila_ddjj(page, anio: int, mes_idx: int, tiempo_espera: int):
+    """Busca, entre las filas de la grilla 'Declaraciones Juradas
+    Presentadas' (ExtJS) YA renderizadas, la fila cuyo periodo (3ra
+    columna, formato 'YYYY-MM') coincide con el mes buscado. La grilla no
+    muestra el nombre del mes en español, sino el periodo en ese formato.
+
+    Si hay 2 filas para el mismo periodo (Original + Rectificativa, ultima
+    columna), se prioriza la Rectificativa por ser la que corrige/reemplaza
+    a la original."""
+    periodo_objetivo = f"{anio}-{mes_idx:02d}"
+    filas = page.locator("tr.x-grid-row")
+    encontradas = []
+    for i in range(filas.count()):
+        fila = filas.nth(i)
+        celdas = fila.locator("td.x-grid-cell")
+        if celdas.count() < 3:
+            continue
+        periodo = _texto_celda(celdas.nth(2), tiempo_espera)
+        if periodo == periodo_objetivo:
+            tipo = _texto_celda(celdas.last, tiempo_espera)
+            encontradas.append((fila, tipo))
+    if not encontradas:
+        return None
+    for fila, tipo in encontradas:
+        if normalizar(tipo) == "rectificativa":
+            return fila
+    return encontradas[0][0]
+
+
+def buscar_fila_ddjj_con_scroll(page, anio: int, mes_idx: int, tiempo_espera: int, intentos_scroll: int = 15):
+    """Igual que buscar_fila_ddjj, pero si no la encuentra de entrada (la
+    grilla tiene 110+ filas y puede no renderizar todas de una, tipico de
+    ExtJS), va scrolleando de a poco y reintentando. Heuristica sin
+    confirmar todavia contra el sitio real -- si no hace falta scrollear,
+    simplemente encuentra la fila en el primer intento y no scrollea nada."""
+    fila = buscar_fila_ddjj(page, anio, mes_idx, tiempo_espera)
+    if fila:
+        return fila
+    for _ in range(intentos_scroll):
+        try:
+            page.mouse.wheel(0, 400)
+        except Exception:
+            break
+        pausar(0.3, 0.15)
+        fila = buscar_fila_ddjj(page, anio, mes_idx, tiempo_espera)
+        if fila:
+            return fila
+    return None
+
+
 def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
-    """Navega e-Sicol -> Declaraciones Juradas presentadas -> anio -> mes."""
+    """Navega e-Sicol -> Declaraciones Juradas presentadas -> busca y abre
+    la fila del periodo pedido."""
     if not _click_si_existe(page, r"e-?sicol", tiempo_espera):
         logger.error("No encontre el enlace 'e-Sicol'")
         return False
@@ -543,10 +604,15 @@ def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
     _click_si_existe(page, r"declaraciones?\s+juradas\s+presentadas", tiempo_espera)
     page.wait_for_load_state("networkidle", timeout=tiempo_espera)
 
-    _click_si_existe(page, str(anio), tiempo_espera)
-    page.wait_for_load_state("networkidle", timeout=tiempo_espera)
-
-    if not _click_si_existe(page, MESES[mes_idx - 1], tiempo_espera):
+    fila = buscar_fila_ddjj_con_scroll(page, anio, mes_idx, tiempo_espera)
+    if not fila:
+        logger.warning("No encontre la fila de %s-%02d en la grilla de DDJJ", anio, mes_idx)
+        return False
+    try:
+        fila.click(timeout=tiempo_espera)
+        pausar()
+    except Exception:
+        logger.error("Encontre la fila de %s-%02d pero no pude clickearla", anio, mes_idx)
         return False
     page.wait_for_load_state("networkidle", timeout=tiempo_espera)
     return True
