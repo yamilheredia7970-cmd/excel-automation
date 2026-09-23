@@ -97,10 +97,9 @@ CONCEPTOS = [
 #   Retenciones > Bancarias  -> "Monto total: $X" (mismo patron, sin
 #                                confirmar todavia con captura propia)
 #   Pagos a Cuenta           -> resuelve "Pago a cuenta"
-#   Otros Creditos           -> por nombre, candidato a "Otros Creditos"
-#                                del Excel (a confirmar: DETALLE decia
-#                                'Saldo a favor DDJJ periodo anterior',
-#                                que en el arbol real es un nodo DISTINTO)
+#   Saldo a Favor DDJJ Periodo Anterior -> "Otros Creditos" del Excel
+#                                (confirmado; el nodo separado "Otros
+#                                Creditos" del arbol NO se usa)
 # Liquidacion del Impuesto, Presentacion -> saldo a favor / importe a
 #   pagar / total pagado: pendiente, todavia no visto en captura.
 #
@@ -115,7 +114,7 @@ NODO_ARBOL = {
     "retenciones_agentes": "Agentes",
     "retenciones_bancarias": "Bancarias",
     "pagos_a_cuenta": "Pagos a Cuenta",
-    "otros_creditos": "Otros Créditos",
+    "saldo_favor_periodo_anterior": "Saldo a Favor DDJJ Periodo Anterior",
 }
 
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
@@ -780,10 +779,15 @@ def leer_pago_a_cuenta(page, tiempo: int) -> Optional[float]:
 
 
 def leer_otros_creditos(page, tiempo: int) -> Optional[float]:
-    """'Otros Créditos' (Rubro 2, nodo separado de 'Saldo a Favor DDJJ
-    Periodo Anterior'). Sin confirmar contra captura propia todavia."""
-    if not abrir_nodo_arbol(page, NODO_ARBOL["otros_creditos"], tiempo):
-        logger.warning("No encontre '%s'", NODO_ARBOL["otros_creditos"])
+    """'Saldo a Favor DDJJ Periodo Anterior' (Rubro 2) -> resuelve "Otros
+    Creditos" del Excel (confirmado). El nodo separado "Otros Creditos"
+    del arbol no se usa. Layout visto por captura: pestaña "Periodo
+    anterior" con columnas Año/Cuota/Importe, mostrando un solo importe
+    (sin filas visibles cuando no hay saldo previo) -- sin HTML propio
+    confirmado todavia, se prueban las mismas 2 estrategias que en el
+    resto de las secciones."""
+    if not abrir_nodo_arbol(page, NODO_ARBOL["saldo_favor_periodo_anterior"], tiempo):
+        logger.warning("No encontre '%s'", NODO_ARBOL["saldo_favor_periodo_anterior"])
         return None
     valor = leer_monto_total(page, tiempo)
     if valor is not None:
