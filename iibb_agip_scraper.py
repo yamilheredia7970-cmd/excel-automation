@@ -119,6 +119,14 @@ NODO_ARBOL = {
 
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 
+# Timeout corto y fijo para "probar" si una celda ya cargada tiene tal o
+# cual sub-estructura (ej. .x-grid-cell-inner). El panel ya esta abierto
+# en este punto, no estamos esperando que algo aparezca -- si se usara el
+# --timeout general (15s por defecto) aca, una sola celda con estructura
+# distinta a la esperada puede colgar el script minutos enteros sumando
+# reintentos, en vez de fallar rapido y seguir con el resto.
+TIMEOUT_CELDA_MS = 600
+
 # Pausas con variacion aleatoria (jitter): un tiempo fijo identico en cada
 # paso es, en si mismo, una firma de script. +/- el jitter de por medio
 # para que el ritmo no sea perfectamente uniforme. Configurables por CLI
@@ -565,7 +573,7 @@ def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int):
     return None, None
 
 
-def _texto_celda(locator_celda, tiempo: int) -> str:
+def _texto_celda(locator_celda, tiempo: int = TIMEOUT_CELDA_MS) -> str:
     try:
         return locator_celda.locator(".x-grid-cell-inner").inner_text(timeout=tiempo).strip()
     except Exception:
@@ -592,9 +600,9 @@ def buscar_fila_ddjj(page, anio: int, mes_idx: int, tiempo_espera: int):
         celdas = fila.locator("td.x-grid-cell")
         if celdas.count() < 3:
             continue
-        periodo = _texto_celda(celdas.nth(2), tiempo_espera)
+        periodo = _texto_celda(celdas.nth(2))
         if periodo == periodo_objetivo:
-            tipo = _texto_celda(celdas.last, tiempo_espera)
+            tipo = _texto_celda(celdas.last)
             encontradas.append((fila, tipo))
     if not encontradas:
         return None
@@ -683,7 +691,7 @@ def abrir_nodo_arbol(page, texto: str, tiempo: int) -> bool:
         return False
 
 
-def leer_filas_grid(scope, tiempo: int) -> List[List[str]]:
+def leer_filas_grid(scope) -> List[List[str]]:
     """Lee todas las filas x-grid-row DENTRO de scope (un locator), fila
     por fila, celda por celda como texto. Generico para cualquier grilla
     ExtJS de #panelContenedor (el panel de detalle a la derecha)."""
@@ -691,7 +699,7 @@ def leer_filas_grid(scope, tiempo: int) -> List[List[str]]:
     filas = scope.locator("tr.x-grid-row")
     for i in range(filas.count()):
         celdas = filas.nth(i).locator("td.x-grid-cell")
-        filas_out.append([_texto_celda(celdas.nth(j), tiempo) for j in range(celdas.count())])
+        filas_out.append([_texto_celda(celdas.nth(j)) for j in range(celdas.count())])
     return filas_out
 
 
@@ -705,7 +713,7 @@ def leer_monto_total(page, tiempo: int) -> Optional[float]:
     except Exception:
         return None
     for candidato in (etiqueta, etiqueta.locator("xpath=.."), etiqueta.locator("xpath=following-sibling::*[1]")):
-        numero = parsear_numero_ar(_texto_celda(candidato, tiempo))
+        numero = parsear_numero_ar(_texto_celda(candidato))
         if numero is not None:
             return numero
     return None
@@ -721,7 +729,7 @@ def leer_rubro1(page, tiempo: int) -> Dict[str, float]:
         logger.warning("No encontre '%s'", NODO_ARBOL["info_calculo"])
         return resultado
 
-    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    filas = leer_filas_grid(page.locator("#panelContenedor"))
     filas_actividad = [f for f in filas if len(f) >= 5 and f[0].strip() and normalizar(f[1]) != "total"]
     fila_total = next((f for f in filas if len(f) >= 5 and normalizar(f[1]) == "total"), None)
 
@@ -749,7 +757,7 @@ def leer_impuestos_internos(page, tiempo: int) -> Optional[float]:
     if not abrir_nodo_arbol(page, NODO_ARBOL["conceptos_no_integran"], tiempo):
         logger.warning("No encontre '%s'", NODO_ARBOL["conceptos_no_integran"])
         return None
-    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    filas = leer_filas_grid(page.locator("#panelContenedor"))
     for f in filas:
         if f and normalizar(f[0]) == "impuestos internos":
             return parsear_numero_ar(f[-1])
@@ -778,7 +786,7 @@ def leer_pago_a_cuenta(page, tiempo: int) -> Optional[float]:
     valor = leer_monto_total(page, tiempo)
     if valor is not None:
         return valor
-    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    filas = leer_filas_grid(page.locator("#panelContenedor"))
     for f in filas:
         if f and normalizar(f[0]) == "total":
             return parsear_numero_ar(f[-1])
@@ -799,7 +807,7 @@ def leer_otros_creditos(page, tiempo: int) -> Optional[float]:
     valor = leer_monto_total(page, tiempo)
     if valor is not None:
         return valor
-    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    filas = leer_filas_grid(page.locator("#panelContenedor"))
     for f in filas:
         if f and normalizar(f[0]) == "total":
             return parsear_numero_ar(f[-1])
