@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, Border, Side
+from openpyxl.styles import Font, Border, Side, PatternFill
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -298,6 +298,13 @@ def leer_padron(wb) -> Dict[int, List[Tuple[str, int, str]]]:
 
 FUENTE_TITULO = Font(bold=True)
 FORMATO_MONEDA = "#,##0.00"
+
+# Mismos colores que ya usa "Lista de Clientes - IIBB" (leyenda E2:H2).
+# El azul (DDJJ HECHA) no tiene relleno propio aca: es un estado que se
+# asigna a mano y el script no lo toca.
+RELLENO_COMPLETOS = PatternFill(fill_type="solid", fgColor="FF92D050")    # verde
+RELLENO_NO_CERRADO = PatternFill(fill_type="solid", fgColor="FFFFE599")  # dorado
+RELLENO_NO_HECHOS = PatternFill(fill_type="solid", fgColor="FFFF0000")   # rojo
 
 
 def _escribir_bloque_vacio(ws: Worksheet, fila_inicio: int, nombre: str,
@@ -966,6 +973,37 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
     return trabajo
 
 
+def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
+                     indice: Dict[Tuple[int, int], BloqueCliente],
+                     fallos: set) -> None:
+    """Pinta el nombre de cada cliente en 'Lista de Clientes - IIBB' segun
+    su estado, con los mismos colores de la leyenda ya existente (E2:H2):
+    verde (COMPLETOS) si no le quedan meses pendientes, rojo (NO HECHOS)
+    si tuvo algun error en esta corrida (prioridad sobre lo demas), dorado
+    (NO ESTA CERRADO) si le quedan meses pendientes sin error puntual. Los
+    clientes no ubicados en ninguna hoja no se tocan (no hay forma de
+    saber su estado real), y el azul (DDJJ HECHA) nunca se pisa."""
+    ws = wb[HOJA_CLIENTES]
+    columnas = {2024: (1, 2), 2025: (4, 5)}
+    for anio, (col_nombre, col_cuit) in columnas.items():
+        for fila in range(3, ws.max_row + 1):
+            cuit_celda = ws.cell(row=fila, column=col_cuit).value
+            if not isinstance(cuit_celda, (int, float)):
+                continue
+            cuit = int(cuit_celda)
+            celda_nombre = ws.cell(row=fila, column=col_nombre)
+
+            if (anio, cuit) in fallos:
+                celda_nombre.fill = RELLENO_NO_HECHOS
+                continue
+
+            bloque = indice.get((anio, cuit))
+            if not bloque:
+                continue
+            pendientes = meses_pendientes(wb[bloque.hoja], bloque)
+            celda_nombre.fill = RELLENO_COMPLETOS if not pendientes else RELLENO_NO_CERRADO
+
+
 def generar_resumen(wb, padron: Dict[int, List[Tuple[str, int, str]]],
                      indice: Dict[Tuple[int, int], BloqueCliente]) -> None:
     """Recorre TODO el padron (2024 y 2025, todos los clientes que figuran en
@@ -1119,6 +1157,8 @@ def main() -> None:
 
     logger.info("Listo. Planilla actualizada: %s", ruta.resolve())
     indice_final = indexar_workbook(wb)
+    colorear_padron(wb, padron, indice_final, {(a, c) for a, _, c in fallos_login})
+    guardar_workbook(wb, ruta)
     generar_resumen(wb, padron, indice_final)
 
 
