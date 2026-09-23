@@ -76,21 +76,47 @@ CONCEPTOS = [
 # comentario, de referencia para quien tenga que ajustar esto mirando el
 # sitio real. "intereses" no tiene campo propio: sale de restar
 # total_pagado - importe_a_pagar_subtotal (asi lo indica DETALLE).
-UBICACION_AGIP = {
-    "base imponible": "Base Imponible",                  # Rubro 1 - Determinacion del anticipo
-    "anticipo determinado": "Valor",                      # Rubro 1 - Determinacion del anticipo (etiqueta generica, ver nota abajo)
-    "retenciones": "Retenciones",                          # Retenciones / Agentes
-    "retenciones bancarias": "Retenciones Bancarias",      # Retenciones / Bancarias
-    "percepciones": "Percepciones",                        # Percepciones / Agentes
-    "impuestos internos": "Impuestos Internos",            # Conceptos que no integran la base imponible
-    "otros creditos": "Saldo a favor DDJJ periodo anterior",
-    "saldo a favor": "Subtotal a favor del contribuyente",
-    "importe a pagar(subtotal)": "Importe neto a ingresar",
-    "total pagado": "Total importe actualizado",
-    "alicuota": "Alicuota",                                # Rubro 1 - Determinacion del anticipo
+# Estructura real de la DDJJ en e-Sicol (ExtJS), confirmada con HTML/capturas
+# reales, no adivinada por texto suelto como al principio. Al hacer doble
+# click en una fila de la grilla de DDJJ presentadas, se entra a una vista
+# de arbol (#ddjjTree, id real) + panel de detalle (#panelContenedor, id
+# real). Cada nodo del arbol, al clickearse, muestra su seccion en el panel.
+#
+# Rubro 1 - Determinacion del anticipo
+#   Informacion para el Calculo del impuesto   -> tabla Cod/Descripcion/
+#                                                  Base imponible/Alicuota/
+#                                                  Valor, con fila "Total".
+#                                                  De aca salen 3 campos:
+#                                                  base imponible, alicuota
+#                                                  y anticipo determinado
+#                                                  (columna "Valor").
+#   Conceptos que no integran la base imponible -> fila "Impuestos Internos"
+# Rubro 2 - Determinacion del saldo del anticipo
+#   Percepciones > Agentes   -> "Monto total: $X"
+#   Retenciones > Agentes    -> "Monto total: $X"
+#   Retenciones > Bancarias  -> "Monto total: $X" (mismo patron, sin
+#                                confirmar todavia con captura propia)
+#   Pagos a Cuenta           -> resuelve "Pago a cuenta"
+#   Otros Creditos           -> por nombre, candidato a "Otros Creditos"
+#                                del Excel (a confirmar: DETALLE decia
+#                                'Saldo a favor DDJJ periodo anterior',
+#                                que en el arbol real es un nodo DISTINTO)
+# Liquidacion del Impuesto, Presentacion -> saldo a favor / importe a
+#   pagar / total pagado: pendiente, todavia no visto en captura.
+#
+# "intereses" no tiene campo propio: sale de restar
+# total_pagado - importe_a_pagar_subtotal (asi lo indica DETALLE).
+NODO_ARBOL = {
+    "info_calculo": "Información para el Cálculo del impuesto",
+    "conceptos_no_integran": "Conceptos que no integran la base imponible",
+    "percepciones": "Percepciones",
+    "percepciones_agentes": "Agentes",
+    "retenciones": "Retenciones",
+    "retenciones_agentes": "Agentes",
+    "retenciones_bancarias": "Bancarias",
+    "pagos_a_cuenta": "Pagos a Cuenta",
+    "otros_creditos": "Otros Créditos",
 }
-# Nota: "Valor" es una etiqueta muy generica. Si extrae el numero incorrecto
-# para "anticipo determinado", es el primer lugar donde hay que mirar.
 
 UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 
@@ -618,68 +644,198 @@ def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
     return True
 
 
-def expandir_secciones(page, tiempo: int) -> None:
-    """Las Retenciones/Percepciones parecen estar en pestañas o acordeones
-    plegados (asi lo describe DETALLE: 'Desplegar la pestaña...'). Intenta
-    abrirlas; si ya estan abiertas o no existen como tales, no hace nada."""
-    for texto in ("Retenciones", "Percepciones"):
-        _click_si_existe(page, texto, tiempo)
+def _nodo_arbol(page, texto: str, tiempo: int):
+    """Locator del <span> de un nodo del arbol de la DDJJ (#ddjjTree, id
+    real confirmado por HTML) por su texto exacto."""
+    nodo = page.locator("#ddjjTree").get_by_text(texto, exact=True).first
+    try:
+        nodo.wait_for(state="visible", timeout=tiempo)
+    except Exception:
+        return None
+    return nodo
 
 
-def obtener_valor_por_etiqueta(page, etiqueta: str, tiempo: int) -> Optional[str]:
-    """Busca un texto en la pagina y devuelve el numero que encuentra al
-    lado (hermano siguiente, fila de tabla, o padre). Prueba primero
-    coincidencia exacta (mas segura) y despues por substring."""
-    patrones = [
-        re.compile(rf"^\s*{re.escape(etiqueta)}\s*:?\s*$", re.I),
-        re.compile(re.escape(etiqueta), re.I),
-    ]
-    xpaths = (
-        "xpath=following-sibling::*[1]",
-        "xpath=../following-sibling::*[1]",
-        "xpath=ancestor::tr[1]//td[last()]",
-        "xpath=parent::*",
-    )
-    for patron in patrones:
-        loc = page.get_by_text(patron).first
-        try:
-            loc.wait_for(state="visible", timeout=tiempo)
-        except Exception:
-            continue
-        for xp in xpaths:
-            try:
-                texto = loc.locator(xp).inner_text(timeout=800)
-            except Exception:
-                continue
-            if parsear_numero_ar(texto) is not None:
-                return texto
+def abrir_nodo_arbol(page, texto: str, tiempo: int) -> bool:
+    """Abre un nodo del arbol de la DDJJ: si es una carpeta sin desplegar
+    todavia, clickea su icono +/- para revelar los hijos; si ya esta
+    desplegada o es una hoja, clickea el texto para que el panel de la
+    derecha (#panelContenedor) muestre su detalle."""
+    nodo = _nodo_arbol(page, texto, tiempo)
+    if nodo is None:
+        return False
+    fila = nodo.locator("xpath=ancestor::tr[contains(@class,'x-grid-row')][1]")
+    clases = fila.get_attribute("class") or ""
+    expansor = fila.locator("img.x-tree-expander")
+    try:
+        if expansor.count() > 0 and "x-grid-tree-node-expanded" not in clases:
+            expansor.first.click(timeout=tiempo)
+        else:
+            nodo.click(timeout=tiempo)
+        pausar()
+        return True
+    except Exception:
+        return False
+
+
+def leer_filas_grid(scope, tiempo: int) -> List[List[str]]:
+    """Lee todas las filas x-grid-row DENTRO de scope (un locator), fila
+    por fila, celda por celda como texto. Generico para cualquier grilla
+    ExtJS de #panelContenedor (el panel de detalle a la derecha)."""
+    filas_out: List[List[str]] = []
+    filas = scope.locator("tr.x-grid-row")
+    for i in range(filas.count()):
+        celdas = filas.nth(i).locator("td.x-grid-cell")
+        filas_out.append([_texto_celda(celdas.nth(j), tiempo) for j in range(celdas.count())])
+    return filas_out
+
+
+def leer_monto_total(page, tiempo: int) -> Optional[float]:
+    """Para secciones tipo Percepciones/Retenciones, que muestran
+    'Monto total: $X' en la parte de arriba del panel de detalle."""
+    try:
+        etiqueta = page.locator("#panelContenedor").get_by_text(
+            re.compile(r"monto\s+total", re.I)).first
+        etiqueta.wait_for(state="visible", timeout=tiempo)
+    except Exception:
+        return None
+    for candidato in (etiqueta, etiqueta.locator("xpath=.."), etiqueta.locator("xpath=following-sibling::*[1]")):
+        numero = parsear_numero_ar(_texto_celda(candidato, tiempo))
+        if numero is not None:
+            return numero
+    return None
+
+
+def leer_rubro1(page, tiempo: int) -> Dict[str, float]:
+    """Abre 'Informacion para el Calculo del impuesto' (Rubro 1) y lee la
+    fila Total: Base Imponible y Valor (=anticipo determinado); y la
+    Alicuota de la primera actividad. Si hay mas de una actividad, se
+    avisa -- el desglose por actividad queda para revision manual."""
+    resultado: Dict[str, float] = {}
+    if not abrir_nodo_arbol(page, NODO_ARBOL["info_calculo"], tiempo):
+        logger.warning("No encontre '%s'", NODO_ARBOL["info_calculo"])
+        return resultado
+
+    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    filas_actividad = [f for f in filas if len(f) >= 5 and f[0].strip() and normalizar(f[1]) != "total"]
+    fila_total = next((f for f in filas if len(f) >= 5 and normalizar(f[1]) == "total"), None)
+
+    if len(filas_actividad) > 1:
+        logger.warning("Cliente con %d actividades en Rubro 1 -- se usa el Total, "
+                        "revisar el desglose a mano si hace falta", len(filas_actividad))
+
+    if fila_total:
+        base = parsear_numero_ar(fila_total[2])
+        valor = parsear_numero_ar(fila_total[4])
+        if base is not None:
+            resultado["base imponible"] = base
+        if valor is not None:
+            resultado["anticipo determinado"] = valor
+    if filas_actividad:
+        alicuota = parsear_numero_ar(filas_actividad[0][3])
+        if alicuota is not None:
+            resultado["alicuota"] = alicuota
+    return resultado
+
+
+def leer_impuestos_internos(page, tiempo: int) -> Optional[float]:
+    """Abre 'Conceptos que no integran la base imponible' (Rubro 1) y lee
+    la fila 'Impuestos Internos'."""
+    if not abrir_nodo_arbol(page, NODO_ARBOL["conceptos_no_integran"], tiempo):
+        logger.warning("No encontre '%s'", NODO_ARBOL["conceptos_no_integran"])
+        return None
+    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    for f in filas:
+        if f and normalizar(f[0]) == "impuestos internos":
+            return parsear_numero_ar(f[-1])
+    return None
+
+
+def leer_seccion_monto_total(page, carpeta: str, hijo: str, tiempo: int) -> Optional[float]:
+    """Para Percepciones > Agentes, Retenciones > Agentes/Bancarias, etc:
+    abre la carpeta, abre el hijo, y lee 'Monto total: $X'."""
+    if not abrir_nodo_arbol(page, carpeta, tiempo):
+        logger.warning("No encontre la carpeta '%s'", carpeta)
+        return None
+    if not abrir_nodo_arbol(page, hijo, tiempo):
+        logger.warning("No encontre '%s' dentro de '%s'", hijo, carpeta)
+        return None
+    return leer_monto_total(page, tiempo)
+
+
+def leer_pago_a_cuenta(page, tiempo: int) -> Optional[float]:
+    """'Pagos a Cuenta' (Rubro 2). Formato de panel sin confirmar contra
+    captura propia todavia: se prueba 'Monto total' primero, y si no,
+    la fila 'Total' de una grilla generica."""
+    if not abrir_nodo_arbol(page, NODO_ARBOL["pagos_a_cuenta"], tiempo):
+        logger.warning("No encontre '%s'", NODO_ARBOL["pagos_a_cuenta"])
+        return None
+    valor = leer_monto_total(page, tiempo)
+    if valor is not None:
+        return valor
+    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    for f in filas:
+        if f and normalizar(f[0]) == "total":
+            return parsear_numero_ar(f[-1])
+    return None
+
+
+def leer_otros_creditos(page, tiempo: int) -> Optional[float]:
+    """'Otros Créditos' (Rubro 2, nodo separado de 'Saldo a Favor DDJJ
+    Periodo Anterior'). Sin confirmar contra captura propia todavia."""
+    if not abrir_nodo_arbol(page, NODO_ARBOL["otros_creditos"], tiempo):
+        logger.warning("No encontre '%s'", NODO_ARBOL["otros_creditos"])
+        return None
+    valor = leer_monto_total(page, tiempo)
+    if valor is not None:
+        return valor
+    filas = leer_filas_grid(page.locator("#panelContenedor"), tiempo)
+    for f in filas:
+        if f and normalizar(f[0]) == "total":
+            return parsear_numero_ar(f[-1])
     return None
 
 
 def extraer_campos(page, tiempo_espera: int) -> Dict[str, float]:
-    """Extrae los valores de la DDJJ actualmente abierta. 'intereses' se
-    calcula (no tiene campo propio), segun la nota de la hoja DETALLE."""
-    expandir_secciones(page, tiempo_espera)
+    """Extrae los valores de la DDJJ actualmente abierta (ya en la vista
+    de arbol #ddjjTree + panel #panelContenedor). 'intereses' se calcula
+    (no tiene campo propio), segun la nota de la hoja DETALLE.
+
+    Pendiente: la seccion 'Liquidacion del Impuesto, Presentacion'
+    (saldo a favor, importe a pagar, total pagado) todavia no se vio en
+    captura -- esos 3 campos no se completan hasta tener esa info."""
     valores: Dict[str, float] = {}
+    valores.update(leer_rubro1(page, tiempo_espera))
 
-    for concepto, etiqueta in UBICACION_AGIP.items():
-        if concepto in ("intereses", "total pagado"):
-            continue
-        texto = obtener_valor_por_etiqueta(page, etiqueta, tiempo_espera)
-        numero = parsear_numero_ar(texto)
-        if numero is not None:
-            valores[concepto] = numero
-        else:
-            logger.warning("No encontre '%s' en la pagina", etiqueta)
+    impuestos_internos = leer_impuestos_internos(page, tiempo_espera)
+    if impuestos_internos is not None:
+        valores["impuestos internos"] = impuestos_internos
 
-    texto_total = obtener_valor_por_etiqueta(page, UBICACION_AGIP["total pagado"], tiempo_espera)
-    texto_importe = obtener_valor_por_etiqueta(page, UBICACION_AGIP["importe a pagar(subtotal)"], tiempo_espera)
-    total_pagina = parsear_numero_ar(texto_total)
-    importe_subtotal = parsear_numero_ar(texto_importe)
-    if total_pagina is not None:
-        valores["total pagado"] = total_pagina
-    if total_pagina is not None and importe_subtotal is not None:
-        valores["intereses"] = round(total_pagina - importe_subtotal, 2)
+    percepciones = leer_seccion_monto_total(
+        page, NODO_ARBOL["percepciones"], NODO_ARBOL["percepciones_agentes"], tiempo_espera)
+    if percepciones is not None:
+        valores["percepciones"] = percepciones
+
+    retenciones = leer_seccion_monto_total(
+        page, NODO_ARBOL["retenciones"], NODO_ARBOL["retenciones_agentes"], tiempo_espera)
+    if retenciones is not None:
+        valores["retenciones"] = retenciones
+
+    retenciones_bancarias = leer_seccion_monto_total(
+        page, NODO_ARBOL["retenciones"], NODO_ARBOL["retenciones_bancarias"], tiempo_espera)
+    if retenciones_bancarias is not None:
+        valores["retenciones bancarias"] = retenciones_bancarias
+
+    pago_a_cuenta = leer_pago_a_cuenta(page, tiempo_espera)
+    if pago_a_cuenta is not None:
+        valores["pago a cuenta"] = pago_a_cuenta
+
+    otros_creditos = leer_otros_creditos(page, tiempo_espera)
+    if otros_creditos is not None:
+        valores["otros creditos"] = otros_creditos
+
+    # TODO: saldo a favor, importe a pagar(subtotal), total pagado e
+    # intereses (calculado) -- pendientes de la seccion "Liquidacion del
+    # Impuesto, Presentacion".
 
     return valores
 
