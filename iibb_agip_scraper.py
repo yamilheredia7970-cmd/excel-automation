@@ -635,7 +635,23 @@ def buscar_fila_ddjj_con_scroll(page, anio: int, mes_idx: int, tiempo_espera: in
 
 def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> bool:
     """Navega e-Sicol -> Declaraciones Juradas presentadas -> busca y abre
-    la fila del periodo pedido."""
+    la fila del periodo pedido.
+
+    Antes que nada, recarga la pagina (equivalente a F5). Es necesario:
+    despues del primer mes procesado quedamos adentro del arbol+panel de
+    esa DDJJ, no en la lista de declaraciones. Clickear 'e-Sicol' desde
+    ahi no "vuelve para atras" de forma confiable (a veces resetea la app
+    a otro estado), y ademas el arbol tambien usa tr.x-grid-row, con lo
+    cual buscar la fila del proximo periodo sin recargar corre el riesgo
+    de terminar mirando filas del arbol de la DDJJ anterior en vez de la
+    grilla de declaraciones. La sesion (cookies) se mantiene al recargar,
+    solo se reinicia el estado interno de la SPA."""
+    try:
+        page.reload(wait_until="networkidle", timeout=tiempo_espera)
+    except Exception:
+        pass
+    pausar()
+
     if not _click_si_existe(page, r"e-?sicol", tiempo_espera):
         logger.error("No encontre el enlace 'e-Sicol'")
         return False
