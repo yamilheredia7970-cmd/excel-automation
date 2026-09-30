@@ -2,5 +2,6 @@
 *.xlsm
 *.backup.xlsx
 *.log
+capturas_errores/
 __pycache__/
 *.pyc

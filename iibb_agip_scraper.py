@@ -26,6 +26,12 @@ Por cada cliente y cada mes pendiente (primero todo 2024, despues 2025):
 Se puede cortar en cualquier momento (Ctrl+C) y volver a correr: retoma
 desde los meses que siguen pendientes.
 
+El navegador (Chromium) se usa siempre, porque e-Sicol es una aplicacion
+que arma sus pantallas con JavaScript. Por defecto corre sin ventana; con
+--sin-headless se ve todo lo que hace. En los dos casos, cada paso queda en
+el log (iibb_agip_FECHA.log) y, si algo falla, se guarda en la carpeta
+capturas_errores/ una captura de pantalla (.png) y el HTML de ese momento.
+
 Pendiente de confirmar contra el sitio real: la seccion "Liquidacion del
 Impuesto, Presentacion" (saldo a favor, importe a pagar y total pagado).
 Se busca por las etiquetas que indica la hoja DETALLE; si no las
@@ -116,6 +122,14 @@ UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 TIMEOUT_NODO_MS = 6000
 TIMEOUT_CONTENIDO_VENTANA_MS = 8000
 MAX_MESES_SEGUIDOS_CON_ERROR = 3
+MAX_CLIENTES_SEGUIDOS_SIN_AGIP = 3   # si AGIP no carga el login, se corta la corrida
+
+# Cuando algo falla se guarda una captura de pantalla (y el HTML) de lo que
+# mostraba el navegador en ese momento, para poder verlo aunque se corra
+# sin ventana. De un mismo aviso repetido se guardan solo las primeras.
+CARPETA_CAPTURAS = Path("capturas_errores")
+MAX_CAPTURAS_POR_AVISO = 3
+MAX_CAPTURAS_POR_ERROR = 20
 
 # Pausas con variacion aleatoria (jitter): un tiempo fijo identico en cada
 # paso es, en si mismo, una firma de script. +/- el jitter de por medio
@@ -1011,6 +1025,30 @@ def pausar_entre_clientes() -> None:
     pausar(PAUSA_ENTRE_CLIENTES, PAUSA_ENTRE_CLIENTES_JITTER)
 
 
+_capturas = {"contexto": "", "cantidad": {}}  # contexto: "CUIT_periodo" que se esta procesando
+
+
+def guardar_captura(page, motivo: str, es_error: bool = False) -> None:
+    """Guarda en CARPETA_CAPTURAS la captura de pantalla (.png) y el HTML de
+    lo que muestra el navegador en este momento. Sirve para ver que paso
+    aunque se corra sin --sin-headless. Nunca corta la corrida si falla."""
+    clave = re.sub(r"[^a-z0-9]+", "-", normalizar(motivo)).strip("-")[:60] or "error"
+    tope = MAX_CAPTURAS_POR_ERROR if es_error else MAX_CAPTURAS_POR_AVISO
+    cantidad = _capturas["cantidad"].get(clave, 0)
+    if cantidad >= tope:
+        return
+    _capturas["cantidad"][clave] = cantidad + 1
+    nombre = "_".join(p for p in (f"{datetime.now():%Y%m%d_%H%M%S}", _capturas["contexto"], clave) if p)
+    try:
+        CARPETA_CAPTURAS.mkdir(parents=True, exist_ok=True)
+        (CARPETA_CAPTURAS / f"{nombre}.html").write_text(page.content(), encoding="utf-8")
+        page.screenshot(path=str(CARPETA_CAPTURAS / f"{nombre}.png"), timeout=10000)
+        logger.info("  Captura de pantalla guardada: %s", CARPETA_CAPTURAS / f"{nombre}.png")
+    except Exception as exc:
+        logger.info("  No pude guardar la captura de pantalla (%s)",
+                    str(exc).splitlines()[0][:120] if str(exc) else type(exc).__name__)
+
+
 def _esperar_red(page, tiempo: int) -> None:
     try:
         page.wait_for_load_state("networkidle", timeout=tiempo)
@@ -1049,57 +1087,67 @@ def _click_si_existe(page, patron_texto: str, tiempo: int) -> bool:
         return False
 
 
-# El enlace 'Clave Ciudad' de la home de AGIP abre claveciudad.agip.gob.ar
-# en una PESTANA NUEVA (target=_blank). En esa pestana nueva hay OTRO
-# enlace, tambien de texto 'Clave Ciudad' pero con onclick="toggleLogin()",
-# que recien ahi despliega el formulario de usuario/contrasena. Selectores
-# tomados del HTML real de la pagina (no son una adivinanza por texto).
+# El enlace 'Clave Ciudad' de la home de AGIP solo abre
+# claveciudad.agip.gob.ar en una pestana nueva, asi que se entra directo
+# ahi. En esa pagina hay OTRO enlace 'Clave Ciudad' (onclick="toggleLogin()")
+# que despliega el formulario de usuario/contrasena. Selectores tomados del
+# HTML real de la pagina.
+URL_CLAVE_CIUDAD = "https://claveciudad.agip.gob.ar/"
 SELECTOR_LINK_CLAVE_CIUDAD = 'a[href="https://claveciudad.agip.gob.ar/"]'
 SELECTOR_LINK_TOGGLE_LOGIN = 'a[onclick*="toggleLogin"]'
+TIMEOUT_CARGA_PAGINA_MS = 30000
+
+
+class LoginNoDisponible(Exception):
+    """No aparecio el formulario de Clave Ciudad: AGIP caida o muy lenta."""
+
+
+def _mostrar_formulario_login(pagina, tiempo_espera: int) -> bool:
+    campo = pagina.locator('input[type="password"]').first
+    try:
+        if not campo.is_visible():
+            pagina.locator(SELECTOR_LINK_TOGGLE_LOGIN).first.click(timeout=tiempo_espera)
+            pausar()
+        campo.wait_for(state="visible", timeout=tiempo_espera)
+        return True
+    except Exception:
+        return False
+
+
+def _abrir_login(page, tiempo_espera: int):
+    """Deja a la vista el formulario de Clave Ciudad y devuelve la pestana
+    donde quedo. Si entrando directo no aparece, prueba el camino de antes:
+    home de AGIP -> enlace 'Clave Ciudad' (que abre otra pestana)."""
+    carga = max(tiempo_espera, TIMEOUT_CARGA_PAGINA_MS)
+    try:
+        page.goto(URL_CLAVE_CIUDAD, wait_until="domcontentloaded", timeout=carga)
+        pausar()
+        if _mostrar_formulario_login(page, tiempo_espera):
+            return page
+    except Exception:
+        pass
+    try:
+        page.goto(BASE_URL, wait_until="domcontentloaded", timeout=carga)
+        pausar()
+        with page.expect_popup(timeout=tiempo_espera) as popup:
+            page.locator(SELECTOR_LINK_CLAVE_CIUDAD).first.click(timeout=tiempo_espera)
+        pestana = popup.value
+        pestana.wait_for_load_state("domcontentloaded", timeout=carga)
+        pausar()
+        if _mostrar_formulario_login(pestana, tiempo_espera):
+            return pestana
+    except Exception:
+        pass
+    raise LoginNoDisponible("no cargo el formulario de Clave Ciudad (AGIP puede estar caida o muy lenta)")
 
 
 def _intentar_login(page, cuit: int, password: str, tiempo_espera: int):
     """Un unico intento de login con una contrasena puntual. Devuelve la
-    pagina donde quedo la sesion activa (la pestana nueva que abre Clave
-    Ciudad) si el login funciono, o None si fallo en cualquier paso."""
-    page.goto(BASE_URL, wait_until="domcontentloaded")
-    pausar()
-
-    try:
-        with page.expect_popup(timeout=tiempo_espera) as popup_info:
-            enlace = page.locator(SELECTOR_LINK_CLAVE_CIUDAD).first
-            enlace.wait_for(state="visible", timeout=tiempo_espera)
-            enlace.click()
-        nueva_pagina = popup_info.value
-    except Exception:
-        logger.error("No se abrio la pestana de Clave Ciudad (%s) en %s",
-                      SELECTOR_LINK_CLAVE_CIUDAD, BASE_URL)
-        return None
-
-    try:
-        nueva_pagina.wait_for_load_state("domcontentloaded", timeout=tiempo_espera)
-    except Exception:
-        pass
-    pausar()
-
-    try:
-        toggle = nueva_pagina.locator(SELECTOR_LINK_TOGGLE_LOGIN).first
-        toggle.wait_for(state="visible", timeout=tiempo_espera)
-        toggle.click()
-        pausar()
-    except Exception:
-        logger.error("No encontre el segundo enlace Clave Ciudad (%s) en la pestana nueva",
-                      SELECTOR_LINK_TOGGLE_LOGIN)
-        nueva_pagina.close()
-        return None
-
+    pestana donde quedo la sesion activa, o None si la contrasena no
+    funciono. Si ni siquiera aparece el formulario lanza LoginNoDisponible
+    (ahi no tiene sentido probar otra contrasena)."""
+    nueva_pagina = _abrir_login(page, tiempo_espera)
     campo_password = nueva_pagina.locator('input[type="password"]').first
-    try:
-        campo_password.wait_for(state="visible", timeout=tiempo_espera)
-    except Exception:
-        logger.error("No aparecio el campo de contrasena tras el segundo click (toggleLogin)")
-        nueva_pagina.close()
-        return None
 
     # El campo de usuario se busca dentro del mismo <form> si existe; si el
     # formulario revelado por toggleLogin no usa <form>, buscamos en toda
@@ -1140,8 +1188,7 @@ def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int):
     """Prueba cada contrasena candidata (la explicita del Excel, si la hay,
     y despues las 2 por defecto) hasta que una funcione. Devuelve
     (password_que_funciono, pagina_activa), o (None, None) si ninguna
-    funciono. pagina_activa puede ser distinta de 'page': Clave Ciudad abre
-    en una pestana nueva, y ahi es donde sigue el resto de la sesion."""
+    funciono. Si AGIP no carga el login, deja pasar LoginNoDisponible."""
     for i, password in enumerate(candidatas):
         pagina_activa = _intentar_login(page, cuit, password, tiempo_espera)
         if pagina_activa:
@@ -1552,8 +1599,8 @@ def ubicar_nodo(page, ruta: list, tiempo: int) -> Optional[int]:
 
 
 def _ruta_legible(ruta: list) -> str:
-    return " > ".join(p.pattern.strip("^$").replace("\\b", "") if isinstance(p, re.Pattern) else str(p)
-                      for p in ruta)
+    return " > ".join(p.pattern.strip("^$").replace("\\b", "").replace("\\", "") if isinstance(p, re.Pattern)
+                      else str(p) for p in ruta)
 
 
 # --------------------------------------------------------------------------
@@ -1679,18 +1726,22 @@ def esperar_ventana(page, tiempo: int):
     return ventana
 
 
-def leer_seccion(page, ruta: list, tiempo: int, espera_ventana: Optional[int] = None) -> Optional[dict]:
-    """Abre la seccion del arbol, lee su ventana entera y la cierra."""
+def leer_seccion(page, ruta: list, tiempo: int, espera_ventana: Optional[int] = None,
+                 cerrar: bool = True) -> Optional[dict]:
+    """Abre la seccion del arbol, lee su ventana entera y la cierra (salvo
+    cerrar=False, para sacarle una captura antes)."""
     cerrar_ventanas(page)
     idx = ubicar_nodo(page, ruta, tiempo)
     if idx is None:
         logger.warning("No encontre '%s' en el arbol de la DDJJ", _ruta_legible(ruta))
+        guardar_captura(page, f"no encontre {_ruta_legible(ruta)}")
         return None
     panel_antes = _texto_panel(page)
     try:
         _texto_nodo(page.locator(SELECTOR_FILAS_ARBOL).nth(idx)).click(timeout=tiempo)
     except Exception:
         logger.warning("No pude clickear '%s' en el arbol", _ruta_legible(ruta))
+        guardar_captura(page, f"no pude clickear {_ruta_legible(ruta)}")
         return None
     pausar()
     esperar_sin_carga(page, tiempo)
@@ -1705,12 +1756,14 @@ def leer_seccion(page, ruta: list, tiempo: int, espera_ventana: Optional[int] = 
         else:
             if espera_ventana is None:
                 logger.warning("'%s' no abrio ninguna ventana", _ruta_legible(ruta))
+                guardar_captura(page, f"sin ventana {_ruta_legible(ruta)}")
             return None
     try:
         datos = ventana.evaluate(JS_LEER_VENTANA)
     except Exception:
         datos = None
-    cerrar_ventanas(page)
+    if cerrar:
+        cerrar_ventanas(page)
     return datos
 
 
@@ -1748,12 +1801,18 @@ def leer_liquidacion(page, tiempo: int) -> Tuple[Dict[str, float], List[str]]:
     rutas.append(raiz)  # por ultimo, la carpeta en si (por si abre su propia ventana)
 
     for ruta in rutas:
-        datos = leer_seccion(page, ruta, tiempo, espera_ventana=4000 if ruta is raiz else None)
+        # Se cierra a mano despues: si la ventana no trae ninguna de las
+        # etiquetas buscadas, conviene la captura con la ventana a la vista.
+        datos = leer_seccion(page, ruta, tiempo, espera_ventana=4000 if ruta is raiz else None, cerrar=False)
         if not datos:
             continue
         textos.append(f"[{datos.get('titulo') or _ruta_legible(ruta)}] {datos.get('texto', '')[:700]}")
         faltan = {k: p for k, p in ETIQUETAS_LIQUIDACION.items() if k not in encontrados}
-        encontrados.update(buscar_etiquetas(datos, faltan))
+        nuevos = buscar_etiquetas(datos, faltan)
+        if not nuevos:
+            guardar_captura(page, f"liquidacion sin etiquetas {_ruta_legible(ruta[-1:])}")
+        cerrar_ventanas(page)
+        encontrados.update(nuevos)
         if len(encontrados) == len(ETIQUETAS_LIQUIDACION):
             break
     return encontrados, textos
@@ -1901,10 +1960,13 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
     False si ninguna contrasena funciono."""
     logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes, %d contrasena(s) a probar",
                 bloque.nombre, bloque.cuit, bloque.anio, len(pendientes), len(candidatas))
+    _capturas["contexto"] = f"{bloque.cuit}_{bloque.anio}"
     password_ok, pagina = iniciar_sesion(page, bloque.cuit, candidatas, tiempo_espera)
     if not password_ok:
         logger.error("CUIT %s: ninguna contrasena funciono (probe %d)", bloque.cuit, len(candidatas))
         reporte.error(bloque, None, "ninguna contrasena funciono")
+        abiertas = [p for p in page.context.pages if not p.is_closed()]
+        guardar_captura(abiertas[-1] if abiertas else page, "login fallido", es_error=True)
         return False
     bloque.password = password_ok
 
@@ -1913,6 +1975,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
     for mes in pendientes:
         periodo = f"{bloque.anio}-{mes:02d}"
         etiqueta = f"{MESES[mes - 1]}/{bloque.anio}"
+        _capturas["contexto"] = f"{bloque.cuit}_{periodo}"
         if periodos_existentes is not None and periodo not in periodos_existentes:
             logger.info("CUIT %s: %s no tiene DDJJ presentada en AGIP", bloque.cuit, etiqueta)
             reporte.falta_ddjj(bloque, mes)
@@ -1932,6 +1995,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
             datos = extraer_campos(pagina, bloque.anio, mes, elegida, tiempo_espera)
             if datos is None:
                 reporte.error(bloque, mes, "la DDJJ que se abrio no era la pedida; no se escribio nada")
+                guardar_captura(pagina, "ddjj equivocada", es_error=True)
                 meses_con_error_seguidos += 1
             else:
                 avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos)
@@ -1944,6 +2008,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
         except Exception as exc:
             logger.exception("Error procesando CUIT %s, %s", bloque.cuit, etiqueta)
             reporte.error(bloque, mes, str(exc).splitlines()[0][:200] if str(exc) else type(exc).__name__)
+            guardar_captura(pagina, f"error {type(exc).__name__}", es_error=True)
             meses_con_error_seguidos += 1
         finally:
             try:
@@ -2129,7 +2194,9 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--cuit", type=int, help="Procesar un unico CUIT (para probar)")
     parser.add_argument("--meses", help="Solo estos meses (1-12), ej: 1,2 (para probar)")
     parser.add_argument("--max-clientes", type=int, help="Limite de clientes a procesar en esta corrida")
-    parser.add_argument("--sin-headless", action="store_true", help="Muestra el navegador (recomendado al probar)")
+    parser.add_argument("--sin-headless", action="store_true",
+                         help="Muestra la ventana del navegador (por defecto corre sin ventana; los errores "
+                              "igual quedan en el log y en capturas_errores/)")
     parser.add_argument("--password", help="Contrasena a usar junto con --cuit si la celda todavia esta vacia")
     parser.add_argument("--timeout", type=int, default=15000, help="Timeout de Playwright en ms (default 15000)")
     parser.add_argument("--pausa-accion", type=float, default=PAUSA_ACCION,
@@ -2199,6 +2266,7 @@ def main() -> None:
         trabajo = trabajo[: args.max_clientes]
 
     reporte = Reporte()
+    sin_agip_seguidos = 0
     sync_playwright = _importar_playwright()
     with sync_playwright() as pw:
         navegador = pw.chromium.launch(headless=not args.sin_headless)
@@ -2210,6 +2278,17 @@ def main() -> None:
                 try:
                     procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
                                      lambda: guardar_workbook(wb, ruta), reporte)
+                    sin_agip_seguidos = 0
+                except LoginNoDisponible as exc:
+                    logger.error("CUIT %s: %s", bloque.cuit, exc)
+                    reporte.error(bloque, None, str(exc))
+                    guardar_captura(pagina, "agip no cargo el login", es_error=True)
+                    sin_agip_seguidos += 1
+                    if sin_agip_seguidos >= MAX_CLIENTES_SEGUIDOS_SIN_AGIP:
+                        logger.error("AGIP no cargo el login con %d clientes seguidos: corto la corrida. "
+                                      "Volve a correr el script mas tarde (retoma desde lo pendiente).",
+                                      sin_agip_seguidos)
+                        break
                 except Exception as exc:
                     logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
                     reporte.error(bloque, None, f"error inesperado: {exc}"[:200])
