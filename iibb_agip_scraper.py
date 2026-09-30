@@ -722,11 +722,54 @@ def _fmt(valor) -> str:
     return "-" if valor is None else f"{valor:,.2f}"
 
 
-def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: DatosDDJJ) -> List[str]:
+def saldo_a_favor_anterior(wb, indice: Dict[Tuple[int, int], BloqueCliente],
+                           bloque: BloqueCliente, mes: int) -> Optional[float]:
+    """'Otros Creditos' de un mes = 'Saldo a favor' del mes anterior, si lo
+    hay. Para enero se usa diciembre del anio anterior (2025 -> hoja 2024)."""
+    if mes > 1:
+        origen, columna = bloque, bloque.columnas_mes.get(mes - 1)
+    else:
+        origen = indice.get((bloque.anio - 1, bloque.cuit))
+        columna = origen.columnas_mes.get(12) if origen else None
+    fila = origen.filas_concepto.get("saldo a favor") if origen else None
+    if not columna or not fila:
+        return None
+    valor = wb[origen.hoja][f"{columna}{fila}"].value
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool) and valor > 0.005:
+        return float(valor)
+    return None
+
+
+def completar_otros_creditos(wb, indice: Dict[Tuple[int, int], BloqueCliente]) -> List[str]:
+    """Completa cada 'Otros Creditos' vacio con el saldo a favor del mes
+    anterior, en todos los clientes y meses (tambien los ya hechos). Nunca
+    pisa una celda con algo escrito."""
+    completados = []
+    for bloque in indice.values():
+        fila = bloque.filas_concepto.get("otros creditos")
+        if not fila:
+            continue
+        ws = wb[bloque.hoja]
+        for mes, columna in sorted(bloque.columnas_mes.items()):
+            celda = ws[f"{columna}{fila}"]
+            saldo = saldo_a_favor_anterior(wb, indice, bloque, mes) if _vacia(celda.value) else None
+            if saldo is not None:
+                celda.value = round(saldo, 2)
+                completados.append(f"[{bloque.anio}] {bloque.nombre} {MESES[mes - 1]}: {_fmt(saldo)}")
+    return completados
+
+
+def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: DatosDDJJ,
+                     saldo_anterior: Optional[float] = None) -> List[str]:
     """Completa las celdas VACIAS del mes con lo extraido de AGIP. Nunca
     pisa una celda que ya tenga algo: si AGIP dice otra cosa, lo devuelve
-    como aviso para revisar a mano. Devuelve la lista de avisos."""
+    como aviso para revisar a mano. 'Otros Creditos' es el saldo a favor del
+    mes anterior (saldo_anterior) si lo hay; si no, lo que muestra AGIP en
+    'Saldo a Favor DDJJ Periodo Anterior'. Devuelve la lista de avisos."""
     avisos: List[str] = []
+    conceptos = dict(datos.conceptos)
+    if saldo_anterior is not None:
+        conceptos["otros creditos"] = saldo_anterior
     col = bloque.columnas_mes.get(mes)
     if not col:
         return [f"el bloque no tiene columna para {MESES[mes - 1]}"]
@@ -764,9 +807,9 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: Dato
     for concepto in ("retenciones", "retenciones bancarias", "percepciones", "impuestos internos",
                      "pago a cuenta", "otros creditos", "saldo a favor",
                      "importe a pagar(subtotal)", "total pagado"):
-        if concepto not in datos.conceptos:
+        if concepto not in conceptos:
             continue
-        valor = datos.conceptos[concepto]
+        valor = conceptos[concepto]
         fila = bloque.filas_concepto.get(concepto)
         if fila is None:
             if abs(valor) >= 0.005:
@@ -1839,7 +1882,10 @@ def extraer_campos(page, anio: int, mes: int, elegida: FilaDDJJ, tiempo: int) ->
         logger.warning("No pude confirmar en el arbol que DDJJ quedo abierta; lo verifico con el titulo")
 
     # Rubro 1 - Informacion para el Calculo del impuesto
-    info = leer_seccion(page, RUTAS["info_calculo"], tiempo)
+    info = leer_seccion(page, RUTAS["info_calculo"], tiempo, cerrar=False)
+    if info and not parsear_rubro1(info)[0] and parsear_rubro1(info)[1] is None:
+        guardar_captura(page, "no pude leer informacion para el calculo")
+    cerrar_ventanas(page)
     if info:
         titulo = parsear_titulo_ventana(info.get("titulo", ""))
         if titulo:
@@ -1877,13 +1923,28 @@ def extraer_campos(page, anio: int, mes: int, elegida: FilaDDJJ, tiempo: int) ->
         ("retenciones", RUTAS["retenciones"], valor_monto_total),
         ("retenciones bancarias", RUTAS["retenciones_bancarias"], valor_monto_total),
     ]
+    # Un 0 que muestra AGIP se registra como 0 (y en el Excel queda en blanco,
+    # como hace la planilla). Lo que NO se pudo leer va a "REVISAR A MANO",
+    # con captura de la ventana, para no confundirlo con un 0 real.
     for concepto, ruta, lector in lectores:
+        valor = None
         try:
-            ventana = leer_seccion(page, ruta, tiempo)
-            valor = lector(ventana) if ventana else None
+            ventana = leer_seccion(page, ruta, tiempo, cerrar=False)
+            if ventana is None:
+                datos.avisos.append(f"no pude abrir '{_ruta_legible(ruta)}' ({concepto} queda sin cargar)")
+            else:
+                valor = lector(ventana)
+                if valor is None and (ventana.get("encabezados") or ventana.get("filas")):
+                    valor = 0.0  # la grilla esta, pero ese mes no tuvo movimientos
+                if valor is None:
+                    datos.avisos.append(f"no pude leer {concepto} en la ventana "
+                                        f"'{ventana.get('titulo') or _ruta_legible(ruta)}'")
+                    guardar_captura(page, f"no pude leer {concepto}")
         except Exception as exc:
             logger.warning("Error leyendo '%s': %s", _ruta_legible(ruta), exc)
-            valor = None
+            datos.avisos.append(f"error leyendo {concepto}: {str(exc).splitlines()[0][:100] if str(exc) else exc!r}")
+        finally:
+            cerrar_ventanas(page)
         if valor is not None:
             datos.conceptos[concepto] = valor
 
@@ -1955,9 +2016,11 @@ class Reporte:
 
 
 def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: List[int],
-                      candidatas: List[str], tiempo_espera: int, guardar_cb, reporte: Reporte) -> bool:
+                      candidatas: List[str], tiempo_espera: int, guardar_cb, reporte: Reporte,
+                      indice: Optional[Dict[Tuple[int, int], BloqueCliente]] = None) -> bool:
     """Devuelve True si logro iniciar sesion (con alguna de las candidatas),
-    False si ninguna contrasena funciono."""
+    False si ninguna contrasena funciono. 'indice' se usa para buscar el
+    saldo a favor de diciembre del anio anterior (Otros Creditos de enero)."""
     logger.info("Cliente %s (CUIT %s, %s): %d mes(es) pendientes, %d contrasena(s) a probar",
                 bloque.nombre, bloque.cuit, bloque.anio, len(pendientes), len(candidatas))
     _capturas["contexto"] = f"{bloque.cuit}_{bloque.anio}"
@@ -1998,7 +2061,8 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
                 guardar_captura(pagina, "ddjj equivocada", es_error=True)
                 meses_con_error_seguidos += 1
             else:
-                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos)
+                saldo_anterior = saldo_a_favor_anterior(ws.parent, indice or {}, bloque, mes)
+                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior)
                 guardar_cb()
                 for aviso in avisos:
                     reporte.aviso(bloque, mes, aviso)
@@ -2277,7 +2341,7 @@ def main() -> None:
                 pagina = contexto.new_page()
                 try:
                     procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
-                                     lambda: guardar_workbook(wb, ruta), reporte)
+                                     lambda: guardar_workbook(wb, ruta), reporte, indice)
                     sin_agip_seguidos = 0
                 except LoginNoDisponible as exc:
                     logger.error("CUIT %s: %s", bloque.cuit, exc)
@@ -2298,6 +2362,13 @@ def main() -> None:
         finally:
             guardar_workbook(wb, ruta)
             navegador.close()
+
+    completados = completar_otros_creditos(wb, indice)
+    if completados:
+        logger.info("--- 'Otros Creditos' completados con el saldo a favor del mes anterior (%d) ---",
+                    len(completados))
+        for linea in completados:
+            logger.info("  %s", linea)
 
     logger.info("Listo. Planilla actualizada: %s", ruta.resolve())
     indice_final = indexar_workbook(wb)
