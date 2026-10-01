@@ -1984,6 +1984,7 @@ class Reporte:
     detalle_errores: List[str] = field(default_factory=list)
     sin_ddjj: Dict[Tuple[int, str, int], List[int]] = field(default_factory=dict)
     revisar: List[str] = field(default_factory=list)
+    sin_procesar: List[str] = field(default_factory=list)   # la corrida se corto antes de llegar a ellos
 
     @staticmethod
     def _quien(bloque: BloqueCliente, mes: Optional[int]) -> str:
@@ -2001,6 +2002,10 @@ class Reporte:
         self.revisar.append(f"{self._quien(bloque, mes)}: {texto}")
 
     def imprimir(self) -> None:
+        if self.sin_procesar:
+            logger.info("--- NO SE LLEGARON A PROCESAR: la corrida se corto antes (%d) ---", len(self.sin_procesar))
+            for linea in self.sin_procesar:
+                logger.info("  %s", linea)
         if self.revisar:
             logger.info("--- REVISAR A MANO (%d) ---", len(self.revisar))
             for linea in self.revisar:
@@ -2172,6 +2177,18 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
     return trabajo
 
 
+def _se_puede_pintar(celda) -> bool:
+    """True si el nombre no tiene color, es blanco, o ya tiene uno de los
+    tres colores que usa este script (verde, dorado, rojo)."""
+    relleno = celda.fill
+    if relleno is None or relleno.fill_type is None:
+        return True
+    color = relleno.fgColor
+    if color is None or color.type != "rgb" or not isinstance(color.rgb, str):
+        return False
+    return color.rgb.upper() in {"00000000", "FFFFFFFF", "FF92D050", "FFFFE599", "FFFF0000"}
+
+
 def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
                      indice: Dict[Tuple[int, int], BloqueCliente],
                      fallos: set) -> None:
@@ -2181,7 +2198,9 @@ def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
     si tuvo algun error en esta corrida (prioridad sobre lo demas), dorado
     (NO ESTA CERRADO) si le quedan meses pendientes sin error puntual. Los
     clientes no ubicados en ninguna hoja no se tocan (no hay forma de
-    saber su estado real), y el azul (DDJJ HECHA) nunca se pisa."""
+    saber su estado real). Solo se pintan nombres sin color o con alguno de
+    estos tres colores: el azul (DDJJ HECHA) y cualquier otro color puesto a
+    mano (amarillo, celeste, etc.) nunca se pisa."""
     ws = wb[HOJA_CLIENTES]
     columnas = {2024: (1, 2), 2025: (4, 5)}
     for anio, (col_nombre, col_cuit) in columnas.items():
@@ -2191,6 +2210,8 @@ def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
                 continue
             cuit = int(cuit_celda)
             celda_nombre = ws.cell(row=fila, column=col_nombre)
+            if not _se_puede_pintar(celda_nombre):
+                continue
 
             if (anio, cuit) in fallos:
                 celda_nombre.fill = RELLENO_NO_HECHOS
@@ -2331,11 +2352,13 @@ def main() -> None:
 
     reporte = Reporte()
     sin_agip_seguidos = 0
+    intentados = 0
     sync_playwright = _importar_playwright()
     with sync_playwright() as pw:
         navegador = pw.chromium.launch(headless=not args.sin_headless)
         try:
             for n, (bloque, ws, pendientes, candidatas) in enumerate(trabajo, start=1):
+                intentados = n
                 logger.info("=== Cliente %d de %d ===", n, len(trabajo))
                 contexto = navegador.new_context()
                 pagina = contexto.new_page()
@@ -2349,9 +2372,10 @@ def main() -> None:
                     guardar_captura(pagina, "agip no cargo el login", es_error=True)
                     sin_agip_seguidos += 1
                     if sin_agip_seguidos >= MAX_CLIENTES_SEGUIDOS_SIN_AGIP:
-                        logger.error("AGIP no cargo el login con %d clientes seguidos: corto la corrida. "
-                                      "Volve a correr el script mas tarde (retoma desde lo pendiente).",
-                                      sin_agip_seguidos)
+                        logger.error("AGIP no cargo el login con %d clientes seguidos: corto la corrida "
+                                      "(quedan %d clientes sin procesar). Volve a correr el script mas tarde "
+                                      "(retoma desde lo pendiente).",
+                                      sin_agip_seguidos, len(trabajo) - n)
                         break
                 except Exception as exc:
                     logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
@@ -2362,6 +2386,10 @@ def main() -> None:
         finally:
             guardar_workbook(wb, ruta)
             navegador.close()
+
+    for bloque, _, pendientes, _ in trabajo[intentados:]:
+        reporte.sin_procesar.append(f"[{bloque.anio}] {bloque.nombre} (CUIT {bloque.cuit}): "
+                                    f"{len(pendientes)} mes(es) pendientes")
 
     completados = completar_otros_creditos(wb, indice)
     if completados:
