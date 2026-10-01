@@ -2002,7 +2002,9 @@ class Reporte:
     detalle_errores: List[str] = field(default_factory=list)
     sin_ddjj: Dict[Tuple[int, str, int], List[int]] = field(default_factory=dict)
     revisar: List[str] = field(default_factory=list)
-    sin_procesar: List[str] = field(default_factory=list)   # la corrida se corto antes de llegar a ellos
+    sin_procesar: List[str] = field(default_factory=list)
+    sin_entrar: Set[Tuple[int, int]] = field(default_factory=set)   # ninguna contrasena funciono
+    entraron: Set[Tuple[int, int]] = field(default_factory=set)   # la corrida se corto antes de llegar a ellos
 
     @staticmethod
     def _quien(bloque: BloqueCliente, mes: Optional[int]) -> str:
@@ -2052,10 +2054,12 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
     if not password_ok:
         logger.error("CUIT %s: ninguna contrasena funciono (probe %d)", bloque.cuit, len(candidatas))
         reporte.error(bloque, None, "ninguna contrasena funciono")
+        reporte.sin_entrar.add((bloque.anio, bloque.cuit))
         abiertas = [p for p in page.context.pages if not p.is_closed()]
         guardar_captura(abiertas[-1] if abiertas else page, "login fallido", es_error=True)
         return False
     bloque.password = password_ok
+    reporte.entraron.add((bloque.anio, bloque.cuit))
 
     periodos_existentes: Optional[Set[str]] = None
     meses_con_error_seguidos = 0
@@ -2255,6 +2259,35 @@ def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
                 continue
             pendientes = meses_pendientes(wb[bloque.hoja], bloque)
             celda_nombre.fill = RELLENO_COMPLETOS if not pendientes else RELLENO_NO_CERRADO
+
+
+NOTA_NO_ENTRAR = "No se puede entrar"
+
+
+def marcar_no_se_puede_entrar(wb, sin_entrar: Set[Tuple[int, int]], entraron: Set[Tuple[int, int]]) -> int:
+    """Escribe 'No se puede entrar' en "Lista de Clientes - IIBB", en la celda
+    de la derecha del CUIT (C para 2024, F para 2025), de los clientes a los
+    que no se pudo entrar con ninguna contrasena y de los que no tienen CUIT.
+    Si un cliente que tenia la nota entro en esta corrida, se la saca."""
+    ws = wb[HOJA_CLIENTES]
+    for letra in ("C", "F"):
+        ws.column_dimensions[letra].width = max(ws.column_dimensions[letra].width or 0, 20)
+    marcados = 0
+    for anio, (col_nombre, col_cuit) in {2024: (1, 2), 2025: (4, 5)}.items():
+        for fila in range(3, ws.max_row + 1):
+            nombre = ws.cell(row=fila, column=col_nombre).value
+            cuit = ws.cell(row=fila, column=col_cuit).value
+            if not isinstance(nombre, str) or normalizar(nombre).startswith(("dia ", "ingresos brutos")):
+                continue
+            nota = ws.cell(row=fila, column=col_cuit + 1)
+            tiene_cuit = isinstance(cuit, (int, float)) and not isinstance(cuit, bool)
+            if not tiene_cuit or (anio, int(cuit)) in sin_entrar:
+                if _vacia(nota.value):
+                    nota.value = NOTA_NO_ENTRAR
+                    marcados += 1
+            elif nota.value == NOTA_NO_ENTRAR and (anio, int(cuit)) in entraron:
+                nota.value = None
+    return marcados
 
 
 def restaurar_colores(ruta: Path, respaldo: Path) -> int:
@@ -2473,6 +2506,7 @@ def main() -> None:
     logger.info("Listo. Planilla actualizada: %s", ruta.resolve())
     indice_final = indexar_workbook(wb)
     colorear_padron(wb, padron, indice_final, reporte.errores)
+    marcar_no_se_puede_entrar(wb, reporte.sin_entrar, reporte.entraron)
     guardar_workbook(wb, ruta)
     generar_resumen(wb, padron, indice_final)
     reporte.imprimir()
