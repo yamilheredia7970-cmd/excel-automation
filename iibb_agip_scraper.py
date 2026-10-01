@@ -49,6 +49,7 @@ import shutil
 import sys
 import time
 import unicodedata
+from copy import copy
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -122,7 +123,9 @@ UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 TIMEOUT_NODO_MS = 6000
 TIMEOUT_CONTENIDO_VENTANA_MS = 8000
 MAX_MESES_SEGUIDOS_CON_ERROR = 3
-MAX_CLIENTES_SEGUIDOS_SIN_AGIP = 3   # si AGIP no carga el login, se corta la corrida
+ESPERA_AGIP_CAIDA = 300       # segundos de espera si AGIP/internet no responde, antes de reintentar
+MAX_REINTENTOS_AGIP = 12      # ~1 hora seguida sin AGIP y recien ahi se corta la corrida
+GUARDAR_CADA_N_MESES = 4      # el Excel se guarda cada N meses y al terminar cada cliente
 
 # Cuando algo falla se guarda una captura de pantalla (y el HTML) de lo que
 # mostraba el navegador en ese momento, para poder verlo aunque se corra
@@ -760,7 +763,7 @@ def completar_otros_creditos(wb, indice: Dict[Tuple[int, int], BloqueCliente]) -
 
 
 def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: DatosDDJJ,
-                     saldo_anterior: Optional[float] = None) -> List[str]:
+                     saldo_anterior: Optional[float] = None, pisar: bool = False) -> List[str]:
     """Completa las celdas VACIAS del mes con lo extraido de AGIP. Nunca
     pisa una celda que ya tenga algo: si AGIP dice otra cosa, lo devuelve
     como aviso para revisar a mano. 'Otros Creditos' es el saldo a favor del
@@ -780,9 +783,19 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: Dato
             return
         celda = ws.cell(row=fila, column=col_idx)
         if not _vacia(celda.value):
-            if isinstance(celda.value, (int, float)) and abs(float(celda.value) - valor) > 0.01:
-                avisos.append(f"{concepto}: la planilla ya tenia {celda.value} y AGIP dice {valor} (no se piso)")
-            return
+            previo = celda.value
+            if not isinstance(previo, (int, float)) or isinstance(previo, bool) or abs(float(previo) - valor) <= 0.01:
+                return
+            # Un 0 en un mes pendiente es un casillero de relleno, y la alicuota
+            # de la planilla es una anotacion: ahi manda AGIP. Cualquier otro
+            # numero distinto no se toca (salvo --rehacer) y queda para revisar.
+            if not (pisar or concepto == "alicuota" or abs(float(previo)) < 0.005):
+                avisos.append(f"{concepto}: la planilla ya tenia {previo} y AGIP dice {valor} (no se piso)")
+                return
+            avisos.append(f"{concepto}: la planilla tenia {previo} y se reemplazo por {valor} (AGIP)")
+            if concepto in CONCEPTOS_CERO_EN_BLANCO and abs(valor) < 0.005:
+                celda.value = None
+                return
         if concepto in CONCEPTOS_CERO_EN_BLANCO and abs(valor) < 0.005:
             return
         celda.value = round(valor, 2)
@@ -1373,6 +1386,11 @@ def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> Resul
         if not filas:
             break
 
+    for _ in range(3):  # la grilla carga aparte: se espera antes de dar por vacia la lista
+        if filas:
+            break
+        time.sleep(4)
+        filas, total = leer_lista_ddjj(page)
     if not filas:
         # ids reales de la pantalla de e-Sicol: si estan, la aplicacion cargo
         # bien y el cliente simplemente no tiene ninguna DDJJ presentada.
@@ -2022,7 +2040,8 @@ class Reporte:
 
 def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: List[int],
                       candidatas: List[str], tiempo_espera: int, guardar_cb, reporte: Reporte,
-                      indice: Optional[Dict[Tuple[int, int], BloqueCliente]] = None) -> bool:
+                      indice: Optional[Dict[Tuple[int, int], BloqueCliente]] = None,
+                      rehacer: bool = False) -> bool:
     """Devuelve True si logro iniciar sesion (con alguna de las candidatas),
     False si ninguna contrasena funciono. 'indice' se usa para buscar el
     saldo a favor de diciembre del anio anterior (Otros Creditos de enero)."""
@@ -2040,6 +2059,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
 
     periodos_existentes: Optional[Set[str]] = None
     meses_con_error_seguidos = 0
+    guardados = 0
     for mes in pendientes:
         periodo = f"{bloque.anio}-{mes:02d}"
         etiqueta = f"{MESES[mes - 1]}/{bloque.anio}"
@@ -2049,7 +2069,15 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
             reporte.falta_ddjj(bloque, mes)
             continue
         try:
-            resultado = ir_a_declaracion(pagina, bloque.anio, mes, tiempo_espera)
+            for intento in (1, 2):  # el primer mes tras el login a veces no carga: se reintenta una vez
+                try:
+                    resultado = ir_a_declaracion(pagina, bloque.anio, mes, tiempo_espera)
+                    break
+                except ErrorNavegacion as exc:
+                    if intento == 2:
+                        raise
+                    logger.warning("CUIT %s: %s: %s -> reintento", bloque.cuit, etiqueta, exc)
+                    pausar(5, 2)
             if resultado.completa:
                 periodos_existentes = resultado.periodos
             if resultado.elegida is None:
@@ -2067,8 +2095,10 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
                 meses_con_error_seguidos += 1
             else:
                 saldo_anterior = saldo_a_favor_anterior(ws.parent, indice or {}, bloque, mes)
-                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior)
-                guardar_cb()
+                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior, rehacer)
+                guardados += 1
+                if guardados % GUARDAR_CADA_N_MESES == 0:
+                    guardar_cb()
                 for aviso in avisos:
                     reporte.aviso(bloque, mes, aviso)
                 logger.info("CUIT %s: %s guardado -> %s", bloque.cuit, etiqueta,
@@ -2088,6 +2118,8 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
             logger.error("CUIT %s: %d meses seguidos con error, paso al siguiente cliente",
                           bloque.cuit, meses_con_error_seguidos)
             break
+    if guardados % GUARDAR_CADA_N_MESES:
+        guardar_cb()
     return True
 
 
@@ -2152,8 +2184,8 @@ def candidatas_password(bloque: BloqueCliente, es_cuit_filtrado: bool,
 
 
 def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: set,
-                      cuit_filtro: Optional[int], password_override: Optional[str],
-                      meses_filtro: Optional[Set[int]] = None
+                      cuit_filtro: Optional[Set[int]], password_override: Optional[str],
+                      meses_filtro: Optional[Set[int]] = None, rehacer: bool = False
                       ) -> List[Tuple[BloqueCliente, Worksheet, List[int], List[str]]]:
     """Arma la lista de (bloque, hoja, meses_pendientes, candidatas_password)
     a procesar, ordenada por anio (todos los de 2024 antes que cualquiera
@@ -2163,15 +2195,16 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
     for (anio, cuit), bloque in indice.items():
         if anio not in anios:
             continue
-        if cuit_filtro and cuit != cuit_filtro:
+        if cuit_filtro and cuit not in cuit_filtro:
             continue
         ws = wb[bloque.hoja]
-        pendientes = meses_pendientes(ws, bloque)
+        # --rehacer: los meses pedidos se vuelven a leer aunque ya tengan datos
+        pendientes = sorted(bloque.columnas_mes) if rehacer else meses_pendientes(ws, bloque)
         if meses_filtro:
             pendientes = [m for m in pendientes if m in meses_filtro]
         if not pendientes:
             continue
-        candidatas = candidatas_password(bloque, cuit_filtro == cuit, password_override)
+        candidatas = candidatas_password(bloque, bool(cuit_filtro) and len(cuit_filtro) == 1 and cuit in cuit_filtro, password_override)
         trabajo.append((bloque, ws, pendientes, candidatas))
     trabajo.sort(key=lambda item: item[0].anio)
     return trabajo
@@ -2224,6 +2257,25 @@ def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
             celda_nombre.fill = RELLENO_COMPLETOS if not pendientes else RELLENO_NO_CERRADO
 
 
+def restaurar_colores(ruta: Path, respaldo: Path) -> int:
+    """Devuelve a "Lista de Clientes - IIBB" los colores puestos a mano (azul
+    DDJJ HECHA, amarillo, celeste, etc.) que una version anterior de este
+    script piso, copiandolos del backup. Solo toca nombres que hoy tienen
+    verde/dorado/rojo/sin color y que en el backup tenian otro color."""
+    wb, wb_viejo = load_workbook(ruta), load_workbook(respaldo)
+    ws, ws_viejo = wb[HOJA_CLIENTES], wb_viejo[HOJA_CLIENTES]
+    restaurados = 0
+    for fila in range(3, ws.max_row + 1):
+        for col in (1, 4):
+            viejo, actual = ws_viejo.cell(row=fila, column=col), ws.cell(row=fila, column=col)
+            if viejo.value and viejo.value == actual.value and not _se_puede_pintar(viejo) and _se_puede_pintar(actual):
+                actual.fill = copy(viejo.fill)
+                restaurados += 1
+    if restaurados:
+        guardar_workbook(wb, ruta)
+    return restaurados
+
+
 def generar_resumen(wb, padron: Dict[int, List[Tuple[str, int, str]]],
                      indice: Dict[Tuple[int, int], BloqueCliente]) -> None:
     """Recorre TODO el padron (2024 y 2025, todos los clientes que figuran en
@@ -2274,9 +2326,14 @@ def construir_argumentos() -> argparse.Namespace:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--excel", type=Path, help="Ruta al archivo .xlsx real")
     parser.add_argument("--crear-demo", action="store_true", help="Genera demo.xlsx de ejemplo y termina")
+    parser.add_argument("--restaurar-colores", action="store_true",
+                         help="Recupera del backup los colores puestos a mano que se pisaron y termina")
     parser.add_argument("--dry-run", action="store_true", help="Solo analiza la planilla, no abre el navegador")
     parser.add_argument("--anios", default="2024,2025", help="Anios a procesar, ej: 2024,2025")
-    parser.add_argument("--cuit", type=int, help="Procesar un unico CUIT (para probar)")
+    parser.add_argument("--cuit", help="Procesar solo este CUIT, o varios separados por coma")
+    parser.add_argument("--rehacer", action="store_true",
+                         help="Vuelve a leer los meses indicados (con --cuit y/o --meses) aunque ya tengan datos, "
+                              "y AGIP reemplaza lo que haya en la planilla")
     parser.add_argument("--meses", help="Solo estos meses (1-12), ej: 1,2 (para probar)")
     parser.add_argument("--max-clientes", type=int, help="Limite de clientes a procesar en esta corrida")
     parser.add_argument("--sin-headless", action="store_true",
@@ -2321,6 +2378,14 @@ def main() -> None:
     anios = {int(a) for a in args.anios.split(",")}
     meses_filtro = {int(m) for m in args.meses.split(",")} if args.meses else None
 
+    if args.restaurar_colores:
+        respaldo = ruta.with_name(ruta.stem + ".backup" + ruta.suffix)
+        if not respaldo.exists():
+            logger.error("No existe el backup %s", respaldo)
+            sys.exit(1)
+        logger.info("Colores restaurados desde el backup: %d", restaurar_colores(ruta, respaldo))
+        return
+
     if args.dry_run:
         # Modo de solo lectura: no crea backup, no crea hojas 2025, no guarda
         # nada. Es seguro correrlo directo sobre el archivo real.
@@ -2344,15 +2409,16 @@ def main() -> None:
     guardar_workbook(wb, ruta)
     indice = indexar_workbook(wb)  # re-indexa incluyendo las hojas 2025 recien creadas
 
-    trabajo = calcular_trabajo(wb, indice, anios, args.cuit, args.password, meses_filtro)
+    cuits = {int(c) for c in args.cuit.replace(" ", "").split(",") if c} if args.cuit else None
+    trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer)
     logger.info("Clientes con meses pendientes: %d", len(trabajo))
 
     if args.max_clientes:
         trabajo = trabajo[: args.max_clientes]
 
     reporte = Reporte()
-    sin_agip_seguidos = 0
     intentados = 0
+    cortar = False
     sync_playwright = _importar_playwright()
     with sync_playwright() as pw:
         navegador = pw.chromium.launch(headless=not args.sin_headless)
@@ -2360,28 +2426,34 @@ def main() -> None:
             for n, (bloque, ws, pendientes, candidatas) in enumerate(trabajo, start=1):
                 intentados = n
                 logger.info("=== Cliente %d de %d ===", n, len(trabajo))
-                contexto = navegador.new_context()
-                pagina = contexto.new_page()
-                try:
-                    procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
-                                     lambda: guardar_workbook(wb, ruta), reporte, indice)
-                    sin_agip_seguidos = 0
-                except LoginNoDisponible as exc:
-                    logger.error("CUIT %s: %s", bloque.cuit, exc)
-                    reporte.error(bloque, None, str(exc))
-                    guardar_captura(pagina, "agip no cargo el login", es_error=True)
-                    sin_agip_seguidos += 1
-                    if sin_agip_seguidos >= MAX_CLIENTES_SEGUIDOS_SIN_AGIP:
-                        logger.error("AGIP no cargo el login con %d clientes seguidos: corto la corrida "
-                                      "(quedan %d clientes sin procesar). Volve a correr el script mas tarde "
-                                      "(retoma desde lo pendiente).",
-                                      sin_agip_seguidos, len(trabajo) - n)
+                for reintento in range(MAX_REINTENTOS_AGIP + 1):
+                    contexto = navegador.new_context()
+                    pagina = contexto.new_page()
+                    try:
+                        procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
+                                         lambda: guardar_workbook(wb, ruta), reporte, indice, args.rehacer)
                         break
-                except Exception as exc:
-                    logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
-                    reporte.error(bloque, None, f"error inesperado: {exc}"[:200])
-                finally:
-                    contexto.close()
+                    except LoginNoDisponible as exc:
+                        guardar_captura(pagina, "agip no cargo el login", es_error=True)
+                        if reintento == MAX_REINTENTOS_AGIP:
+                            logger.error("CUIT %s: %s. Hace %d reintentos que AGIP/internet no responde: corto la "
+                                          "corrida (quedan %d clientes sin procesar). Volve a correr el script "
+                                          "mas tarde (retoma desde lo pendiente).",
+                                          bloque.cuit, exc, reintento, len(trabajo) - n)
+                            reporte.error(bloque, None, str(exc))
+                            cortar = True
+                            break
+                        logger.warning("AGIP o internet no responde (%s). Espero %d min y reintento (%d/%d)...",
+                                       exc, ESPERA_AGIP_CAIDA // 60, reintento + 1, MAX_REINTENTOS_AGIP)
+                        time.sleep(ESPERA_AGIP_CAIDA)
+                    except Exception as exc:
+                        logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
+                        reporte.error(bloque, None, f"error inesperado: {exc}"[:200])
+                        break
+                    finally:
+                        contexto.close()
+                if cortar:
+                    break
                 pausar_entre_clientes()
         finally:
             guardar_workbook(wb, ruta)
