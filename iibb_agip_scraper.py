@@ -281,8 +281,24 @@ class BloqueCliente:
 RE_CODIGO_TEXTO = re.compile(r"^\s*(\d{5,8})(?:\s+(\S.*))?$")
 
 
+RE_CUIT_TEXTO = re.compile(r"^\s*(\d{2})\D?(\d{8})\D?(\d)\s*$")
+
+
+def _cuit_de_celda(valor) -> Optional[int]:
+    """CUIT/CUIL de una celda: un numero de 11 digitos o el mismo escrito como
+    texto ('20939665502', '20-93966550-2'), que tambien aparece en la planilla."""
+    if isinstance(valor, bool):
+        return None
+    if isinstance(valor, (int, float)):
+        return int(valor) if UMBRAL_CUIT <= valor < 10 * UMBRAL_CUIT and float(valor).is_integer() else None
+    if isinstance(valor, str):
+        m = RE_CUIT_TEXTO.match(valor)
+        return int("".join(m.groups())) if m else None
+    return None
+
+
 def _es_cuit(valor) -> bool:
-    return isinstance(valor, (int, float)) and not isinstance(valor, bool) and valor >= UMBRAL_CUIT
+    return _cuit_de_celda(valor) is not None
 
 
 def _codigo_actividad(valor_a, valor_b) -> Optional[Tuple[str, str]]:
@@ -373,7 +389,7 @@ def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
 
             if _es_cuit(valor_a):
                 if cuit_valor is None:
-                    cuit_valor = int(valor_a)
+                    cuit_valor = _cuit_de_celda(valor_a)
                     fila_cuit = fila
                     password = _password_de_celda(valor_b)
                 continue
@@ -419,9 +435,13 @@ def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
     return bloques
 
 
+_REPETIDOS_AVISADOS: Set[Tuple[int, int]] = set()
+
+
 def indexar_workbook(wb) -> Dict[Tuple[int, int], BloqueCliente]:
     """Escanea todas las hojas DIA-N (2024) y DIA-N - 2025 y arma un indice
-    (anio, cuit) -> BloqueCliente."""
+    (anio, cuit) -> BloqueCliente. Si un cliente tiene dos bloques (el mismo
+    CUIT repetido en la lista), se usa el primero."""
     indice: Dict[Tuple[int, int], BloqueCliente] = {}
     for nombre in wb.sheetnames:
         nombre_limpio = nombre.strip()
@@ -432,7 +452,14 @@ def indexar_workbook(wb) -> Dict[Tuple[int, int], BloqueCliente]:
         else:
             continue
         for bloque in parsear_hoja_dia(wb[nombre], anio):
-            if bloque.cuit:
+            if bloque.cuit and (anio, bloque.cuit) in indice:
+                previo = indice[(anio, bloque.cuit)]
+                if (anio, bloque.cuit) not in _REPETIDOS_AVISADOS:
+                    _REPETIDOS_AVISADOS.add((anio, bloque.cuit))
+                    logger.warning("El CUIT %s (%s) tiene dos bloques: %s fila %s y %s fila %s. Se carga el primero.",
+                                    bloque.cuit, bloque.nombre, previo.hoja, previo.fila_encabezado,
+                                    nombre, bloque.fila_encabezado)
+            elif bloque.cuit:
                 indice[(anio, bloque.cuit)] = bloque
             else:
                 logger.warning("No pude identificar el CUIT de %r en %s (fila %s)",
@@ -463,8 +490,8 @@ def leer_padron(wb) -> Dict[int, List[Tuple[str, int, str]]]:
             if isinstance(nombre, str) and normalizar(nombre).startswith("dia "):
                 dia_actual = normalizar_dia(nombre)
                 continue
-            if nombre and isinstance(cuit, (int, float)):
-                padron[anio].append((str(nombre).strip(), int(cuit), dia_actual))
+            if nombre and _cuit_de_celda(cuit):
+                padron[anio].append((str(nombre).strip(), _cuit_de_celda(cuit), dia_actual))
     return padron
 
 
@@ -585,12 +612,52 @@ def crear_hojas_2025(wb, padron: Dict[int, List[Tuple[str, int, str]]],
             ws.column_dimensions[get_column_letter(col)].width = 14
 
         fila = 1
-        clientes = [(n, c) for n, c, d in padron[2025] if d == dia]
+        clientes, vistos = [], set()
+        for n, c, d in padron[2025]:     # un solo bloque por CUIT aunque la lista lo repita
+            if d == dia and c not in vistos:
+                vistos.add(c)
+                clientes.append((n, c))
         for nombre, cuit in clientes:
             previo = indice_2024.get((2024, cuit))
             password = passwords_previas.get(cuit) or (previo.password if previo else None)
             fila = _escribir_bloque_vacio(ws, fila, nombre, cuit, password, _actividades_de_bloque(previo))
         logger.info("Hoja %s creada con %d clientes", nombre_hoja, len(clientes))
+
+
+def _ultima_fila_con_contenido(ws: Worksheet) -> int:
+    for fila in range(ws.max_row, 0, -1):
+        if any(c.value not in (None, "") for c in ws[fila]):
+            return fila
+    return 0
+
+
+def agregar_bloques_faltantes(wb, padron: Dict[int, List[Tuple[str, int, str]]],
+                              indice: Dict[Tuple[int, int], BloqueCliente]) -> List[str]:
+    """Los clientes de la lista que no tienen NINGUN bloque en las hojas (por
+    ejemplo clientes de 2024 que todavia no se armaron) reciben uno vacio al
+    final de la hoja de su DIA, para que se carguen igual que los demas. No
+    se toca nada de lo que ya hay. Devuelve la descripcion de lo creado."""
+    creados: List[str] = []
+    hechos: Set[Tuple[int, int]] = set()
+    for anio in (2024, 2025):
+        for nombre, cuit, dia in padron.get(anio, []):
+            if (anio, cuit) in indice or (anio, cuit) in hechos:
+                continue
+            hechos.add((anio, cuit))
+            nombre_hoja = f"{dia}{SUFIJO_2025}" if anio == 2025 else dia
+            if nombre_hoja in wb.sheetnames:
+                ws = wb[nombre_hoja]
+            else:
+                ws = wb.create_sheet(nombre_hoja)
+                ws.column_dimensions["A"].width = 32
+                for col in range(2, 15):
+                    ws.column_dimensions[get_column_letter(col)].width = 14
+            previo = indice.get((2024, cuit)) if anio == 2025 else None
+            fila = _ultima_fila_con_contenido(ws) + (3 if ws.max_row > 1 else 1)
+            _escribir_bloque_vacio(ws, fila, nombre, cuit, previo.password if previo else None,
+                                   _actividades_de_bloque(previo))
+            creados.append(f"[{anio}] {nombre} (CUIT {cuit}): bloque nuevo en '{nombre_hoja}', fila {fila}")
+    return creados
 
 
 # --------------------------------------------------------------------------
@@ -863,8 +930,15 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: Dato
     'Saldo a Favor DDJJ Periodo Anterior'. Devuelve la lista de avisos."""
     avisos: List[str] = []
     conceptos = dict(datos.conceptos)
-    if saldo_anterior is not None:
+    # 'Otros Creditos' es lo que AGIP aplico como saldo a favor del periodo
+    # anterior. Solo si AGIP no muestra nada (0) se completa con el saldo a favor
+    # del mes anterior de la planilla, siempre que lo haya (pedido de la contadora).
+    de_agip = conceptos.get("otros creditos")
+    if saldo_anterior is not None and (de_agip is None or abs(de_agip) < 0.005):
         conceptos["otros creditos"] = saldo_anterior
+        if de_agip is not None:
+            avisos.append(f"otros creditos: AGIP no aplico saldo a favor del periodo anterior; se puso el saldo a "
+                          f"favor del mes anterior de la planilla ({_fmt(saldo_anterior)})")
     col = bloque.columnas_mes.get(mes)
     if not col:
         return [f"el bloque no tiene columna para {MESES[mes - 1]}"]
@@ -2462,10 +2536,9 @@ def colorear_padron(wb, padron: Dict[int, List[Tuple[str, int, str]]],
     columnas = {2024: (1, 2), 2025: (4, 5)}
     for anio, (col_nombre, col_cuit) in columnas.items():
         for fila in range(3, ws.max_row + 1):
-            cuit_celda = ws.cell(row=fila, column=col_cuit).value
-            if not isinstance(cuit_celda, (int, float)):
+            cuit = _cuit_de_celda(ws.cell(row=fila, column=col_cuit).value)
+            if not cuit:
                 continue
-            cuit = int(cuit_celda)
             celda_nombre = ws.cell(row=fila, column=col_nombre)
             if not _se_puede_pintar(celda_nombre):
                 continue
@@ -2500,14 +2573,69 @@ def marcar_no_se_puede_entrar(wb, sin_entrar: Set[Tuple[int, int]], entraron: Se
             if not isinstance(nombre, str) or normalizar(nombre).startswith(("dia ", "ingresos brutos")):
                 continue
             nota = ws.cell(row=fila, column=col_cuit + 1)
-            tiene_cuit = isinstance(cuit, (int, float)) and not isinstance(cuit, bool)
-            if not tiene_cuit or (anio, int(cuit)) in sin_entrar:
+            tiene_cuit = _cuit_de_celda(cuit) is not None
+            if not tiene_cuit or (anio, _cuit_de_celda(cuit)) in sin_entrar:
                 if _vacia(nota.value):
                     nota.value = NOTA_NO_ENTRAR
                     marcados += 1
-            elif nota.value == NOTA_NO_ENTRAR and (anio, int(cuit)) in entraron:
+            elif nota.value == NOTA_NO_ENTRAR and (anio, _cuit_de_celda(cuit)) in entraron:
                 nota.value = None
     return marcados
+
+
+TOLERANCIA_AUDITORIA = 2.0   # pesos
+
+
+def auditar_planilla(wb, indice: Dict[Tuple[int, int], BloqueCliente]
+                     ) -> List[Tuple[int, str, int, List[Tuple[str, float]]]]:
+    """Controla, mes por mes, que las cuentas de la planilla cierren:
+    anticipo determinado de todas las actividades - retenciones - retenciones
+    bancarias - percepciones - pago a cuenta - otros creditos tiene que dar
+    el importe a pagar (si es positivo) o el saldo a favor (si es negativo).
+    Si no cierra, casi siempre falta cargar algo (una actividad, un credito).
+    Solo mira meses con Total pagado; los que tienen texto o formulas en esas
+    celdas no se pueden evaluar y se saltean. Devuelve (anio, nombre, cuit,
+    [(mes, diferencia)]) por cada cliente con meses que no cierran."""
+    def numero(ws, col, fila):
+        if not fila:
+            return 0.0
+        v = ws[f"{col}{fila}"].value
+        if v is None or (isinstance(v, str) and not v.strip()):
+            return 0.0
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    resultado = []
+    for (anio, cuit), b in sorted(indice.items(), key=lambda kv: (kv[0][0], kv[1].nombre.lower())):
+        ws, fc, malos = wb[b.hoja], b.filas_concepto, []
+        for mes, col in sorted(b.columnas_mes.items()):
+            if not fc.get("total pagado") or _vacia(ws[f"{col}{fc['total pagado']}"].value):
+                continue
+            conceptos = {k: numero(ws, col, fc.get(k)) for k in (
+                "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos",
+                "importe a pagar(subtotal)", "saldo a favor")}
+            anticipos = [numero(ws, col, a.fila_anticipo) for a in b.actividades]
+            if None in conceptos.values() or None in anticipos:
+                continue
+            neto = sum(anticipos) - sum(conceptos[k] for k in (
+                "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos"))
+            dif = max(abs(conceptos["importe a pagar(subtotal)"] - max(neto, 0.0)),
+                      abs(conceptos["saldo a favor"] - max(-neto, 0.0)))
+            if dif > TOLERANCIA_AUDITORIA:
+                malos.append((MESES[mes - 1], round(dif, 2)))
+        if malos:
+            resultado.append((anio, b.nombre, cuit, malos))
+    return resultado
+
+
+def imprimir_auditoria(resultado) -> None:
+    meses = sum(len(m_) for *_, m_ in resultado)
+    logger.info("--- MESES QUE NO CIERRAN: %d meses en %d clientes ---", meses, len(resultado))
+    for anio, nombre, cuit, malos in resultado:
+        logger.info("  [%s] %s (CUIT %s): %s", anio, nombre, cuit,
+                    ", ".join(f"{mes[:3]} ${dif:,.0f}" for mes, dif in malos))
+    if resultado:
+        logger.info("  (diferencia entre lo que daria la cuenta y lo cargado en Importe a pagar / Saldo a favor: "
+                    "suele faltar una actividad o un credito; con --rehacer --cuit se vuelve a leer de AGIP)")
 
 
 def restaurar_colores(ruta: Path, respaldo: Path) -> int:
@@ -2552,6 +2680,14 @@ def generar_resumen(wb, padron: Dict[int, List[Tuple[str, int, str]]],
             else:
                 completos.append((anio, bloque.nombre, cuit))
 
+    for anio in (2024, 2025):
+        cuenta: Dict[int, List[str]] = {}
+        for nombre, cuit, dia in padron.get(anio, []):
+            cuenta.setdefault(cuit, []).append(f"{nombre} ({dia})")
+        repetidos = {c: v for c, v in cuenta.items() if len(v) > 1}
+        if repetidos:
+            logger.info("--- Clientes repetidos en la lista %s (borrar la fila de mas): %s ---", anio,
+                        "; ".join(f"{v[0]} x{len(v)}" for v in repetidos.values()))
     total = len(completos) + len(pendientes) + len(no_encontrados)
     logger.info("=" * 60)
     logger.info("RESUMEN: %d clientes en el padron (2024 + 2025)", total)
@@ -2581,6 +2717,8 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--crear-demo", action="store_true", help="Genera demo.xlsx de ejemplo y termina")
     parser.add_argument("--restaurar-colores", action="store_true",
                          help="Recupera del backup los colores puestos a mano que se pisaron y termina")
+    parser.add_argument("--auditar", action="store_true",
+                         help="Solo lectura: lista los meses cuyas cuentas no cierran (suele faltar cargar algo)")
     parser.add_argument("--dry-run", action="store_true", help="Solo analiza la planilla, no abre el navegador")
     parser.add_argument("--anios", default="2024,2025", help="Anios a procesar, ej: 2024,2025")
     parser.add_argument("--cuit", help="Procesar solo este CUIT, o varios separados por coma")
@@ -2639,6 +2777,11 @@ def main() -> None:
         logger.info("Colores restaurados desde el backup: %d", restaurar_colores(ruta, respaldo))
         return
 
+    if args.auditar:
+        wb = load_workbook(ruta)
+        imprimir_auditoria(auditar_planilla(wb, indexar_workbook(wb)))
+        return
+
     if args.dry_run:
         # Modo de solo lectura: no crea backup, no crea hojas 2025, no guarda
         # nada. Es seguro correrlo directo sobre el archivo real.
@@ -2659,8 +2802,15 @@ def main() -> None:
     indice = indexar_workbook(wb)
 
     crear_hojas_2025(wb, padron, indice)
-    guardar_workbook(wb, ruta)
     indice = indexar_workbook(wb)  # re-indexa incluyendo las hojas 2025 recien creadas
+    creados = agregar_bloques_faltantes(wb, padron, indice)
+    for linea in creados:
+        logger.info("  %s", linea)
+    if creados:
+        logger.info("Se crearon %d bloques para clientes de la lista que no tenian ninguno", len(creados))
+    guardar_workbook(wb, ruta)
+    if creados:
+        indice = indexar_workbook(wb)
 
     cuits = {int(c) for c in args.cuit.replace(" ", "").split(",") if c} if args.cuit else None
     trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer)
@@ -2735,6 +2885,9 @@ def main() -> None:
     guardar_workbook(wb, ruta)
     generar_resumen(wb, padron, indice_final)
     reporte.imprimir()
+    no_cierran = auditar_planilla(wb, indice_final)
+    if no_cierran:
+        logger.info("Hay %d meses cuyas cuentas no cierran (ver con --auditar)", sum(len(m_) for *_, m_ in no_cierran))
 
 
 if __name__ == "__main__":
