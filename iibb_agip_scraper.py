@@ -2483,7 +2483,8 @@ def candidatas_password(bloque: BloqueCliente, es_cuit_filtrado: bool,
 
 def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: set,
                       cuit_filtro: Optional[Set[int]], password_override: Optional[str],
-                      meses_filtro: Optional[Set[int]] = None, rehacer: bool = False
+                      meses_filtro: Optional[Set[int]] = None, rehacer: bool = False,
+                      descuadrados: bool = False
                       ) -> List[Tuple[BloqueCliente, Worksheet, List[int], List[str]]]:
     """Arma la lista de (bloque, hoja, meses_pendientes, candidatas_password)
     a procesar, ordenada por anio (todos los de 2024 antes que cualquiera
@@ -2496,8 +2497,14 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
         if cuit_filtro and cuit not in cuit_filtro:
             continue
         ws = wb[bloque.hoja]
-        # --rehacer: los meses pedidos se vuelven a leer aunque ya tengan datos
-        pendientes = sorted(bloque.columnas_mes) if rehacer else meses_pendientes(ws, bloque)
+        # --rehacer: los meses pedidos se vuelven a leer aunque ya tengan datos.
+        # --corregir: solo los meses cuyas cuentas no cierran.
+        if descuadrados:
+            pendientes = [mes for mes, _ in meses_que_no_cierran(wb, bloque)]
+        elif rehacer:
+            pendientes = sorted(bloque.columnas_mes)
+        else:
+            pendientes = meses_pendientes(ws, bloque)
         if meses_filtro:
             pendientes = [m for m in pendientes if m in meses_filtro]
         if not pendientes:
@@ -2586,17 +2593,15 @@ def marcar_no_se_puede_entrar(wb, sin_entrar: Set[Tuple[int, int]], entraron: Se
 TOLERANCIA_AUDITORIA = 2.0   # pesos
 
 
-def auditar_planilla(wb, indice: Dict[Tuple[int, int], BloqueCliente]
-                     ) -> List[Tuple[int, str, int, List[Tuple[str, float]]]]:
-    """Controla, mes por mes, que las cuentas de la planilla cierren:
-    anticipo determinado de todas las actividades - retenciones - retenciones
-    bancarias - percepciones - pago a cuenta - otros creditos tiene que dar
-    el importe a pagar (si es positivo) o el saldo a favor (si es negativo).
-    Si no cierra, casi siempre falta cargar algo (una actividad, un credito).
-    Solo mira meses con Total pagado; los que tienen texto o formulas en esas
-    celdas no se pueden evaluar y se saltean. Devuelve (anio, nombre, cuit,
-    [(mes, diferencia)]) por cada cliente con meses que no cierran."""
-    def numero(ws, col, fila):
+def meses_que_no_cierran(wb, b: BloqueCliente) -> List[Tuple[int, float]]:
+    """Meses (numero, diferencia en pesos) de un cliente cuyas cuentas no
+    cierran: anticipo determinado de todas las actividades - retenciones -
+    retenciones bancarias - percepciones - pago a cuenta - otros creditos tiene
+    que dar el importe a pagar (si es positivo) o el saldo a favor (si es
+    negativo). Si no cierra, casi siempre falta cargar algo (una actividad, un
+    credito). Solo mira meses con Total pagado; los que tienen texto o
+    formulas en esas celdas no se pueden evaluar y se saltean."""
+    def numero(col, fila):
         if not fila:
             return 0.0
         v = ws[f"{col}{fila}"].value
@@ -2604,26 +2609,34 @@ def auditar_planilla(wb, indice: Dict[Tuple[int, int], BloqueCliente]
             return 0.0
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
+    ws, fc, malos = wb[b.hoja], b.filas_concepto, []
+    for mes, col in sorted(b.columnas_mes.items()):
+        if not fc.get("total pagado") or _vacia(ws[f"{col}{fc['total pagado']}"].value):
+            continue
+        conceptos = {k: numero(col, fc.get(k)) for k in (
+            "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos",
+            "importe a pagar(subtotal)", "saldo a favor")}
+        anticipos = [numero(col, a.fila_anticipo) for a in b.actividades]
+        if None in conceptos.values() or None in anticipos:
+            continue
+        neto = sum(anticipos) - sum(conceptos[k] for k in (
+            "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos"))
+        dif = max(abs(conceptos["importe a pagar(subtotal)"] - max(neto, 0.0)),
+                  abs(conceptos["saldo a favor"] - max(-neto, 0.0)))
+        if dif > TOLERANCIA_AUDITORIA:
+            malos.append((mes, round(dif, 2)))
+    return malos
+
+
+def auditar_planilla(wb, indice: Dict[Tuple[int, int], BloqueCliente]
+                     ) -> List[Tuple[int, str, int, List[Tuple[str, float]]]]:
+    """Devuelve (anio, nombre, cuit, [(mes, diferencia)]) por cada cliente con
+    meses que no cierran (ver meses_que_no_cierran)."""
     resultado = []
     for (anio, cuit), b in sorted(indice.items(), key=lambda kv: (kv[0][0], kv[1].nombre.lower())):
-        ws, fc, malos = wb[b.hoja], b.filas_concepto, []
-        for mes, col in sorted(b.columnas_mes.items()):
-            if not fc.get("total pagado") or _vacia(ws[f"{col}{fc['total pagado']}"].value):
-                continue
-            conceptos = {k: numero(ws, col, fc.get(k)) for k in (
-                "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos",
-                "importe a pagar(subtotal)", "saldo a favor")}
-            anticipos = [numero(ws, col, a.fila_anticipo) for a in b.actividades]
-            if None in conceptos.values() or None in anticipos:
-                continue
-            neto = sum(anticipos) - sum(conceptos[k] for k in (
-                "retenciones", "retenciones bancarias", "percepciones", "pago a cuenta", "otros creditos"))
-            dif = max(abs(conceptos["importe a pagar(subtotal)"] - max(neto, 0.0)),
-                      abs(conceptos["saldo a favor"] - max(-neto, 0.0)))
-            if dif > TOLERANCIA_AUDITORIA:
-                malos.append((MESES[mes - 1], round(dif, 2)))
+        malos = meses_que_no_cierran(wb, b)
         if malos:
-            resultado.append((anio, b.nombre, cuit, malos))
+            resultado.append((anio, b.nombre, cuit, [(MESES[mes - 1], dif) for mes, dif in malos]))
     return resultado
 
 
@@ -2722,6 +2735,9 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Solo analiza la planilla, no abre el navegador")
     parser.add_argument("--anios", default="2024,2025", help="Anios a procesar, ej: 2024,2025")
     parser.add_argument("--cuit", help="Procesar solo este CUIT, o varios separados por coma")
+    parser.add_argument("--corregir", action="store_true",
+                         help="Vuelve a leer de AGIP SOLO los meses cuyas cuentas no cierran (ver --auditar) y reemplaza "
+                              "lo que difiera. Se combina con --anios y --cuit")
     parser.add_argument("--rehacer", action="store_true",
                          help="Vuelve a leer los meses indicados (con --cuit y/o --meses) aunque ya tengan datos, "
                               "y AGIP reemplaza lo que haya en la planilla")
@@ -2813,7 +2829,7 @@ def main() -> None:
         indice = indexar_workbook(wb)
 
     cuits = {int(c) for c in args.cuit.replace(" ", "").split(",") if c} if args.cuit else None
-    trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer)
+    trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer, args.corregir)
     logger.info("Clientes con meses pendientes: %d", len(trabajo))
 
     if args.max_clientes:
@@ -2834,7 +2850,8 @@ def main() -> None:
                     pagina = contexto.new_page()
                     try:
                         procesar_cliente(pagina, ws, bloque, pendientes, candidatas, args.timeout,
-                                         lambda: guardar_workbook(wb, ruta), reporte, indice, args.rehacer)
+                                         lambda: guardar_workbook(wb, ruta), reporte, indice,
+                                         args.rehacer or args.corregir)
                         break
                     except LoginNoDisponible as exc:
                         guardar_captura(pagina, "agip no cargo el login", es_error=True)
