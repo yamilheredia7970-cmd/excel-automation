@@ -19,9 +19,11 @@ Por cada cliente y cada mes pendiente (primero todo 2024, despues 2025):
   2. confirma que lo abierto sea el anio/mes/version pedidos;
   3. lee cada seccion del arbol (Rubro 1, Rubro 2 y Liquidacion) y cierra
      cada ventana apenas la lee;
-  4. completa en el Excel SOLO las celdas vacias de ese mes (nunca pisa lo
-     que ya estaba cargado a mano), cada actividad en su propia fila, y
-     guarda antes de pasar al mes siguiente.
+  4. completa en el Excel las celdas vacias de ese mes (un 0 de relleno se
+     reemplaza; cualquier otro numero distinto no se pisa y queda avisado),
+     cada actividad en su propia fila. Si AGIP muestra una actividad que la
+     planilla de 2025 no tiene, crea debajo del cliente el bloque de esa
+     actividad. Guarda cada pocos meses y al terminar cada cliente.
 
 Se puede cortar en cualquier momento (Ctrl+C) y volver a correr: retoma
 desde los meses que siguen pendientes.
@@ -57,6 +59,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter, column_index_from_string
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -123,6 +126,7 @@ UMBRAL_CUIT = 10 ** 10  # un CUIT/CUIL tiene 11 digitos
 TIMEOUT_NODO_MS = 6000
 TIMEOUT_CONTENIDO_VENTANA_MS = 8000
 MAX_MESES_SEGUIDOS_CON_ERROR = 3
+REINTENTOS_MENSAJE_ESICOL = 3   # veces que se abre una seccion si e-Sicol muestra un cuadro de error
 ESPERA_AGIP_CAIDA = 300       # segundos de espera si AGIP/internet no responde, antes de reintentar
 MAX_REINTENTOS_AGIP = 12      # ~1 hora seguida sin AGIP y recien ahi se corta la corrida
 GUARDAR_CADA_N_MESES = 4      # el Excel se guarda cada N meses y al terminar cada cliente
@@ -248,6 +252,7 @@ class BloqueActividad:
     fila_alicuota: Optional[int] = None
     codigo: Optional[str] = None
     descripcion: Optional[str] = None
+    fila_codigo: Optional[int] = None
 
 
 @dataclass
@@ -345,6 +350,7 @@ def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
         sub_bloques: List[BloqueActividad] = []
         sub_actual: Optional[BloqueActividad] = None
         codigo_principal: Optional[Tuple[str, str]] = None
+        fila_codigo_principal: Optional[int] = None
         cuit_valor = None
         fila_cuit = None
         password = None
@@ -377,8 +383,10 @@ def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
                 if sub_actual is not None:
                     if sub_actual.codigo is None:
                         sub_actual.codigo, sub_actual.descripcion = codigo
+                        sub_actual.fila_codigo = fila
                 elif codigo_principal is None:
                     codigo_principal = codigo
+                    fila_codigo_principal = fila
 
         fila_alicuota = None
         fila_total_pagado = filas_concepto.get("total pagado")
@@ -398,6 +406,7 @@ def parsear_hoja_dia(ws: Worksheet, anio: int) -> List[BloqueCliente]:
                 fila_alicuota=fila_alicuota,
                 codigo=codigo_principal[0] if codigo_principal else None,
                 descripcion=codigo_principal[1] if codigo_principal else None,
+                fila_codigo=fila_codigo_principal,
             ))
         actividades.extend(sub_bloques)
 
@@ -688,14 +697,18 @@ def _puntaje(act: Actividad, destino: BloqueActividad) -> float:
     return puntaje
 
 
-def emparejar_actividades(agip: List[Actividad], excel: List[BloqueActividad]
+def emparejar_actividades(agip: List[Actividad], excel: List[BloqueActividad], estricto: bool = False
                            ) -> Tuple[List[Tuple[Actividad, BloqueActividad]], List[Actividad]]:
     """Decide en que filas del Excel va cada actividad que muestra AGIP, por
     codigo (tolerando un digito de diferencia) y por descripcion. Devuelve
-    (pares, actividades_sin_lugar)."""
+    (pares, actividades_sin_lugar). Con una sola actividad en AGIP y un solo
+    bloque en la planilla van juntos aunque el codigo no coincida (puede ser
+    un codigo mal tipeado), salvo en modo 'estricto' -el que se usa cuando se
+    puede crear el bloque que falta-, donde una actividad distinta es una
+    actividad nueva."""
     if not agip or not excel:
         return [], list(agip)
-    if len(agip) == 1 and len(excel) == 1:
+    if len(agip) == 1 and len(excel) == 1 and (not estricto or not excel[0].codigo or _puntaje(agip[0], excel[0]) > 0):
         return [(agip[0], excel[0])], []
 
     candidatos = sorted(((p, i, j) for i, a in enumerate(agip) for j, e in enumerate(excel)
@@ -711,12 +724,14 @@ def emparejar_actividades(agip: List[Actividad], excel: List[BloqueActividad]
         usados_excel.add(j)
 
     # Un bloque del Excel sin codigo cargado (cliente nuevo en 2025) se queda
-    # con la primera actividad que haya quedado sin lugar.
+    # con la actividad de mayor base que haya quedado sin lugar (la
+    # principal); las demas van a un sub-bloque propio.
     libres = [j for j, e in enumerate(excel) if j not in usados_excel and not e.codigo]
     sueltas = [i for i in range(len(agip)) if i not in usados_agip]
     if len(libres) == 1 and sueltas:
-        pares.append((agip[sueltas[0]], excel[libres[0]]))
-        usados_agip.add(sueltas[0])
+        principal = max(sueltas, key=lambda i: agip[i].base or 0)
+        pares.append((agip[principal], excel[libres[0]]))
+        usados_agip.add(principal)
 
     return pares, [a for i, a in enumerate(agip) if i not in usados_agip]
 
@@ -762,8 +777,85 @@ def completar_otros_creditos(wb, indice: Dict[Tuple[int, int], BloqueCliente]) -
     return completados
 
 
+FILAS_SUBBLOQUE = 5   # base imponible, anticipo, alicuota, codigo y una fila en blanco
+
+
+def _hoja_extensible(ws: Worksheet, bloque: BloqueCliente) -> bool:
+    """Solo en las hojas 'DIA N - 2025' que genera este script se agregan
+    filas; las hojas 2024 son las que armo a mano la contadora (celdas
+    combinadas, formatos) y ahi no se toca la estructura."""
+    return bool(bloque.anio == 2025 and bloque.fila_cuit and RE_HOJA_DIA_2025.match(ws.title.strip()))
+
+
+def _ultima_fila_del_bloque(bloque: BloqueCliente) -> int:
+    filas = [bloque.fila_cuit or bloque.fila_encabezado]
+    for a in bloque.actividades:
+        filas += [f for f in (a.fila_base, a.fila_anticipo, a.fila_alicuota, a.fila_codigo) if f]
+    if bloque.fila_alicuota:
+        filas.append(bloque.fila_alicuota + 1)
+    return max(filas)
+
+
+def _insertar_filas(ws: Worksheet, desde: int, cantidad: int) -> None:
+    """Inserta filas vacias en 'desde' y corre todo lo de abajo, incluidas las
+    formulas y las celdas combinadas, que openpyxl no ajusta por su cuenta."""
+    combinadas = [(r.min_row, r.min_col, r.max_row, r.max_col) for r in ws.merged_cells.ranges if r.min_row >= desde]
+    for f0, c0, f1, c1 in combinadas:
+        ws.unmerge_cells(start_row=f0, start_column=c0, end_row=f1, end_column=c1)
+    ws.insert_rows(desde, cantidad)
+    for fila in ws.iter_rows(min_row=desde + cantidad):
+        for celda in fila:
+            if isinstance(celda.value, str) and celda.value.startswith("="):
+                origen = f"{celda.column_letter}{celda.row - cantidad}"
+                celda.value = Translator(celda.value, origin=origen).translate_formula(celda.coordinate)
+    for f0, c0, f1, c1 in combinadas:
+        ws.merge_cells(start_row=f0 + cantidad, start_column=c0, end_row=f1 + cantidad, end_column=c1)
+
+
+def refrescar_bloques(ws: Worksheet, anio: int, indice: Dict[Tuple[int, int], BloqueCliente]) -> None:
+    """Vuelve a leer los bloques de la hoja y actualiza, en el mismo objeto,
+    los del indice (las filas cambian al insertar un sub-bloque, y los
+    clientes que siguen en la lista de trabajo usan esos mismos objetos)."""
+    for nuevo in parsear_hoja_dia(ws, anio):
+        viejo = indice.get((anio, nuevo.cuit)) if nuevo.cuit else None
+        if viejo is not None:
+            password = viejo.password
+            viejo.__dict__.update(nuevo.__dict__)
+            viejo.password = password or nuevo.password
+
+
+def agregar_subbloque(ws: Worksheet, bloque: BloqueCliente, act: Actividad,
+                      indice: Dict[Tuple[int, int], BloqueCliente]) -> None:
+    """Agrega debajo del cliente el sub-bloque de una actividad nueva (Base
+    Imponible, anticipo determinado, alicuota y codigo), igual que la
+    planilla de la contadora cuando un cliente tiene mas de una actividad."""
+    desde = _ultima_fila_del_bloque(bloque) + 2
+    _insertar_filas(ws, desde, FILAS_SUBBLOQUE)
+    _escribir_fila_concepto(ws, desde, "base imponible")
+    _escribir_fila_concepto(ws, desde + 1, "anticipo determinado")
+    _escribir_fila_codigo(ws, desde + 3, (act.codigo, act.descripcion))
+    refrescar_bloques(ws, bloque.anio, indice)
+    logger.info("  %s: bloque nuevo para la actividad %s (%s) en %s, filas %d-%d",
+                bloque.nombre, act.codigo, act.descripcion[:40], ws.title, desde, desde + 3)
+
+
+def _completar_codigo(ws: Worksheet, bloque: BloqueCliente, destino: BloqueActividad, act: Actividad) -> None:
+    """Si el bloque principal de un cliente nuevo en 2025 no tiene todavia el
+    codigo de actividad, se lo escribe (asi las proximas lecturas la
+    reconocen por codigo y no por orden)."""
+    if destino.codigo or not act.codigo:
+        return
+    fila = destino.fila_codigo
+    if fila is None and destino.fila_alicuota and bloque.fila_cuit == destino.fila_alicuota + 2:
+        fila = destino.fila_alicuota + 1   # orden de las hojas generadas: alicuota, codigo, CUIT
+    if fila and _vacia(ws.cell(row=fila, column=1).value) and _vacia(ws.cell(row=fila, column=2).value):
+        _escribir_fila_codigo(ws, fila, (act.codigo, act.descripcion))
+        destino.codigo, destino.descripcion, destino.fila_codigo = act.codigo, act.descripcion, fila
+
+
 def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: DatosDDJJ,
-                     saldo_anterior: Optional[float] = None, pisar: bool = False) -> List[str]:
+                     saldo_anterior: Optional[float] = None, pisar: bool = False,
+                     indice: Optional[Dict[Tuple[int, int], BloqueCliente]] = None) -> List[str]:
     """Completa las celdas VACIAS del mes con lo extraido de AGIP. Nunca
     pisa una celda que ya tenga algo: si AGIP dice otra cosa, lo devuelve
     como aviso para revisar a mano. 'Otros Creditos' es el saldo a favor del
@@ -803,8 +895,15 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: Dato
             celda.number_format = formato
 
     # 1) Base imponible, anticipo y alicuota: cada actividad en SU fila.
-    pares, sin_lugar = emparejar_actividades(datos.actividades, bloque.actividades)
+    puede_crear = indice is not None and _hoja_extensible(ws, bloque)
+    pares, sin_lugar = emparejar_actividades(datos.actividades, bloque.actividades, estricto=puede_crear)
+    if sin_lugar and puede_crear:
+        for act in sorted(sin_lugar, key=lambda a: -(a.base or 0)):
+            agregar_subbloque(ws, bloque, act, indice)
+        pares, sin_lugar = emparejar_actividades(datos.actividades, bloque.actividades, estricto=True)
     for act, destino in pares:
+        if _hoja_extensible(ws, bloque):
+            _completar_codigo(ws, bloque, destino, act)
         poner(destino.fila_base, act.base, "base imponible")
         poner(destino.fila_anticipo, act.valor, "anticipo determinado")
         poner(destino.fila_alicuota, act.alicuota, "alicuota", formato=None)
@@ -1155,7 +1254,41 @@ TIMEOUT_CARGA_PAGINA_MS = 30000
 
 
 class LoginNoDisponible(Exception):
-    """No aparecio el formulario de Clave Ciudad: AGIP caida o muy lenta."""
+    """No hay login posible ahora: no aparecio el formulario de Clave Ciudad o
+    AGIP no respondio. AGIP caida o muy lenta, no una clave mala. 'reintentos',
+    'espera' (segundos) y 'cortar' dicen que hacer con el cliente: por defecto
+    se espera y se reintenta, y si sigue sin andar se corta la corrida."""
+
+    def __init__(self, mensaje: str, reintentos: Optional[int] = None, espera: Optional[float] = None,
+                 cortar: bool = True):
+        super().__init__(mensaje)
+        self.reintentos, self.espera, self.cortar = reintentos, espera, cortar
+
+
+# Elementos del Portal del Contribuyente que aparece despues de entrar bien
+# (ids reales del HTML del portal) y textos con los que AGIP rechaza el login.
+SELECTOR_PORTAL = "#aplicaciones, #frmRepresentado"
+RE_LOGIN_RECHAZADO = re.compile(r"incorrect|bloquead|inv[aá]lid|no autorizad", re.I)
+ESPERA_RESULTADO_LOGIN_S = 15
+
+
+def _esperar_resultado_login(pagina) -> Optional[bool]:
+    """True si despues de apretar 'Ingresar' aparece el portal; False si AGIP
+    rechaza usuario/clave; None si pasa el tiempo sin ninguna de las dos
+    cosas. Se mira que APAREZCA el portal: dar por bueno el login porque ya
+    no se ve el campo de clave es enganoso, porque tampoco se lo ve mientras
+    la pagina esta cargando."""
+    limite = time.monotonic() + ESPERA_RESULTADO_LOGIN_S
+    while time.monotonic() < limite:
+        try:
+            if pagina.locator(SELECTOR_PORTAL).count() > 0:
+                return True
+            if pagina.get_by_text(RE_LOGIN_RECHAZADO).first.is_visible():
+                return False
+        except Exception:
+            pass  # la pagina esta cambiando de pantalla
+        time.sleep(0.4)
+    return None
 
 
 def _mostrar_formulario_login(pagina, tiempo_espera: int) -> bool:
@@ -1226,17 +1359,16 @@ def _intentar_login(page, cuit: int, password: str, tiempo_espera: int):
     else:
         campo_password.press("Enter")
 
-    try:
-        nueva_pagina.wait_for_load_state("networkidle", timeout=tiempo_espera)
-    except Exception:
-        pass
-    pausar()
-
-    # Si el login fallo, lo mas probable es que sigamos viendo el mismo
-    # campo de contrasena (formulario no avanzo).
-    sigue_en_login = nueva_pagina.locator('input[type="password"]').count() > 0
-    if sigue_en_login:
+    resultado = _esperar_resultado_login(nueva_pagina)
+    if resultado is None:
+        # Ni portal ni mensaje de clave incorrecta: no se sabe si la clave sirve.
+        # No se prueba otra ni se marca al cliente como "sin acceso"; se reintenta
+        # un par de veces y, si sigue igual, se sigue con el proximo cliente.
+        raise LoginNoDisponible(f"AGIP no respondio despues de ingresar usuario y clave ({ESPERA_RESULTADO_LOGIN_S}s)",
+                                reintentos=2, espera=60, cortar=False)
+    if not resultado:
         return None
+    pausar()
     return nueva_pagina
 
 
@@ -1246,7 +1378,18 @@ def iniciar_sesion(page, cuit: int, candidatas: List[str], tiempo_espera: int):
     (password_que_funciono, pagina_activa), o (None, None) si ninguna
     funciono. Si AGIP no carga el login, deja pasar LoginNoDisponible."""
     for i, password in enumerate(candidatas):
-        pagina_activa = _intentar_login(page, cuit, password, tiempo_espera)
+        for intento in (1, 2):
+            try:
+                pagina_activa = _intentar_login(page, cuit, password, tiempo_espera)
+                break
+            except LoginNoDisponible:
+                raise
+            except Exception as exc:  # ej. un campo que no se deja clickear: se reintenta una vez
+                motivo = str(exc).splitlines()[0][:120] if str(exc) else type(exc).__name__
+                if intento == 2:
+                    raise LoginNoDisponible(f"fallo el formulario de login ({motivo})") from exc
+                logger.warning("CUIT %s: fallo el formulario de login (%s) -> reintento", cuit, motivo)
+                pausar(3, 1)
         if pagina_activa:
             return password, pagina_activa
         logger.info("CUIT %s: contrasena candidata %d/%d no funciono", cuit, i + 1, len(candidatas))
@@ -1354,7 +1497,29 @@ class ErrorNavegacion(Exception):
     """No se pudo llegar a la lista de DDJJ o abrir la DDJJ elegida."""
 
 
-def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> ResultadoLista:
+def elegir_representado(page, cuit: Optional[int], tiempo_espera: int) -> None:
+    """El portal tiene un desplegable 'Seleccione un representado' cuando el
+    cliente representa a otras personas, y deja elegido al PRIMERO de la
+    lista; si no es el propio cliente, no aparece e-Sicol (solo los
+    aplicativos de esa otra persona). Se elige al propio cliente."""
+    if not cuit:
+        return
+    try:
+        selector = page.locator("select#cuit_representado").first
+        if selector.count() == 0:
+            return
+        opciones = selector.locator("option").evaluate_all("(o) => o.map((x) => x.value)")
+        if str(cuit) in opciones and selector.input_value() != str(cuit):
+            selector.select_option(value=str(cuit), timeout=tiempo_espera)
+            pausar()
+            _esperar_red(page, tiempo_espera)
+    except Exception as exc:
+        logger.warning("No pude elegir el representado %s en el portal (%s)", cuit,
+                       str(exc).splitlines()[0][:100] if str(exc) else type(exc).__name__)
+
+
+def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int,
+                     cuit: Optional[int] = None) -> ResultadoLista:
     """Navega e-Sicol -> Declaraciones Juradas Presentadas -> abre (doble
     click) la ultima version presentada del periodo pedido.
 
@@ -1367,6 +1532,7 @@ def ir_a_declaracion(page, anio: int, mes_idx: int, tiempo_espera: int) -> Resul
         pass
     pausar()
 
+    elegir_representado(page, cuit, tiempo_espera)
     if not _click_si_existe(page, r"e-?sicol", tiempo_espera):
         raise ErrorNavegacion("no encontre el enlace 'e-Sicol' (¿se cerro la sesion?)")
     _esperar_red(page, tiempo_espera)
@@ -1670,7 +1836,9 @@ def _ruta_legible(ruta: list) -> str:
 # agentes. Año: 2024 - Mes: Enero - Tipo: Original".
 # --------------------------------------------------------------------------
 
-SELECTOR_VENTANA = "div.x-window:visible"
+SELECTOR_VENTANA = "div.x-window:not(.x-message-box):visible"
+SELECTOR_CUADRO = "div.x-message-box:visible"   # cuadros tipo "Error interno: Intente nuevamente mas tarde"
+RE_BOTON_ACEPTAR = re.compile(r"^\s*(aceptar|ok|cerrar)\s*$", re.I)
 SELECTOR_PANEL_DETALLE = "#panelContenedor"
 
 
@@ -1731,11 +1899,46 @@ JS_LEER_VENTANA = r"""
 """
 
 
+def _cuadros_con_boton(page):
+    """Cuadros de mensaje a la vista que tienen boton 'Aceptar'. Un cuadro de
+    espera ('Cargando...') no tiene botones y se va solo: no cuenta."""
+    return page.locator(SELECTOR_CUADRO).filter(has=page.get_by_text(RE_BOTON_ACEPTAR))
+
+
+def textos_cuadros(page) -> List[str]:
+    """Texto de los cuadros de mensaje de e-Sicol que estan a la vista."""
+    try:
+        return [re.sub(r"\s+", " ", t).strip() for t in _cuadros_con_boton(page).all_inner_texts() if t.strip()]
+    except Exception:
+        return []
+
+
+def _aceptar_cuadro(page, cuadro, tiempo: int) -> None:
+    """Cierra un cuadro de mensaje: tiene boton 'Aceptar', no tiene X."""
+    for intento in (
+        lambda: cuadro.get_by_text(RE_BOTON_ACEPTAR).first.click(timeout=tiempo),
+        lambda: cuadro.locator(".x-tool-close").first.click(timeout=tiempo),
+        lambda: page.keyboard.press("Enter"),
+    ):
+        try:
+            intento()
+            return
+        except Exception:
+            continue
+
+
 def cerrar_ventanas(page, tiempo: int = 3000) -> int:
-    """Cierra todas las ventanas de detalle abiertas (boton X de cada una)."""
+    """Cierra todas las ventanas de detalle abiertas (boton X de cada una) y
+    acepta los cuadros de mensaje que aparezcan."""
     cerradas = 0
     for _ in range(15):
         try:
+            cuadros = _cuadros_con_boton(page)
+            if cuadros.count():
+                _aceptar_cuadro(page, cuadros.last, tiempo)
+                cerradas += 1
+                time.sleep(0.3)
+                continue
             ventanas = page.locator(SELECTOR_VENTANA)
             cantidad = ventanas.count()
         except Exception:
@@ -1766,6 +1969,8 @@ def esperar_ventana(page, tiempo: int):
     ventana = None
     while time.monotonic() < limite:
         try:
+            if _cuadros_con_boton(page).count():
+                return None  # e-Sicol mostro un mensaje: no hay ventana de datos que esperar
             cantidad = page.locator(SELECTOR_VENTANA).count()
         except Exception:
             cantidad = 0
@@ -1791,22 +1996,37 @@ def leer_seccion(page, ruta: list, tiempo: int, espera_ventana: Optional[int] = 
                  cerrar: bool = True) -> Optional[dict]:
     """Abre la seccion del arbol, lee su ventana entera y la cierra (salvo
     cerrar=False, para sacarle una captura antes)."""
-    cerrar_ventanas(page)
-    idx = ubicar_nodo(page, ruta, tiempo)
-    if idx is None:
-        logger.warning("No encontre '%s' en el arbol de la DDJJ", _ruta_legible(ruta))
-        guardar_captura(page, f"no encontre {_ruta_legible(ruta)}")
-        return None
-    panel_antes = _texto_panel(page)
-    try:
-        _texto_nodo(page.locator(SELECTOR_FILAS_ARBOL).nth(idx)).click(timeout=tiempo)
-    except Exception:
-        logger.warning("No pude clickear '%s' en el arbol", _ruta_legible(ruta))
-        guardar_captura(page, f"no pude clickear {_ruta_legible(ruta)}")
-        return None
-    pausar()
-    esperar_sin_carga(page, tiempo)
-    ventana = esperar_ventana(page, espera_ventana or tiempo)
+    for intento in range(1, REINTENTOS_MENSAJE_ESICOL + 1):
+        cerrar_ventanas(page)
+        idx = ubicar_nodo(page, ruta, tiempo)
+        if idx is None:
+            logger.warning("No encontre '%s' en el arbol de la DDJJ", _ruta_legible(ruta))
+            guardar_captura(page, f"no encontre {_ruta_legible(ruta)}")
+            return None
+        panel_antes = _texto_panel(page)
+        try:
+            _texto_nodo(page.locator(SELECTOR_FILAS_ARBOL).nth(idx)).click(timeout=tiempo)
+        except Exception:
+            logger.warning("No pude clickear '%s' en el arbol", _ruta_legible(ruta))
+            guardar_captura(page, f"no pude clickear {_ruta_legible(ruta)}")
+            return None
+        pausar()
+        esperar_sin_carga(page, tiempo)
+        ventana = esperar_ventana(page, espera_ventana or tiempo)
+        mensajes = textos_cuadros(page)
+        if not mensajes:
+            break
+        # e-Sicol mostro un cuadro (ej. "Error interno: Intente nuevamente mas
+        # tarde"): se acepta y se vuelve a abrir la seccion; si insiste, se
+        # deja sin cargar y queda avisado, en vez de trabarse en ese mes.
+        logger.warning("e-Sicol mostro un mensaje al abrir '%s': %s%s", _ruta_legible(ruta), " | ".join(mensajes)[:160],
+                       " -> reintento" if intento < REINTENTOS_MENSAJE_ESICOL else "")
+        if intento == 1:
+            guardar_captura(page, f"mensaje de e-sicol en {_ruta_legible(ruta)}")
+        cerrar_ventanas(page)
+        if intento == REINTENTOS_MENSAJE_ESICOL:
+            return None
+        pausar(3, 1)
     if ventana is None:
         # Respaldo: si en vez de una ventana flotante el detalle aparecio en
         # el panel de la derecha (#panelContenedor, id real), se lee de ahi.
@@ -2075,7 +2295,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
         try:
             for intento in (1, 2):  # el primer mes tras el login a veces no carga: se reintenta una vez
                 try:
-                    resultado = ir_a_declaracion(pagina, bloque.anio, mes, tiempo_espera)
+                    resultado = ir_a_declaracion(pagina, bloque.anio, mes, tiempo_espera, bloque.cuit)
                     break
                 except ErrorNavegacion as exc:
                     if intento == 2:
@@ -2099,7 +2319,7 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
                 meses_con_error_seguidos += 1
             else:
                 saldo_anterior = saldo_a_favor_anterior(ws.parent, indice or {}, bloque, mes)
-                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior, rehacer)
+                avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior, rehacer, indice)
                 guardados += 1
                 if guardados % GUARDAR_CADA_N_MESES == 0:
                     guardar_cb()
@@ -2468,17 +2688,22 @@ def main() -> None:
                         break
                     except LoginNoDisponible as exc:
                         guardar_captura(pagina, "agip no cargo el login", es_error=True)
-                        if reintento == MAX_REINTENTOS_AGIP:
-                            logger.error("CUIT %s: %s. Hace %d reintentos que AGIP/internet no responde: corto la "
-                                          "corrida (quedan %d clientes sin procesar). Volve a correr el script "
-                                          "mas tarde (retoma desde lo pendiente).",
-                                          bloque.cuit, exc, reintento, len(trabajo) - n)
+                        maximo = MAX_REINTENTOS_AGIP if exc.reintentos is None else exc.reintentos
+                        espera = ESPERA_AGIP_CAIDA if exc.espera is None else exc.espera
+                        if reintento >= maximo:
                             reporte.error(bloque, None, str(exc))
-                            cortar = True
+                            if exc.cortar:
+                                logger.error("CUIT %s: %s. Hace %d reintentos que AGIP/internet no responde: corto la "
+                                              "corrida (quedan %d clientes sin procesar). Volve a correr el script "
+                                              "mas tarde (retoma desde lo pendiente).",
+                                              bloque.cuit, exc, reintento, len(trabajo) - n)
+                                cortar = True
+                            else:
+                                logger.error("CUIT %s: %s. Sigo con el siguiente cliente.", bloque.cuit, exc)
                             break
-                        logger.warning("AGIP o internet no responde (%s). Espero %d min y reintento (%d/%d)...",
-                                       exc, ESPERA_AGIP_CAIDA // 60, reintento + 1, MAX_REINTENTOS_AGIP)
-                        time.sleep(ESPERA_AGIP_CAIDA)
+                        logger.warning("AGIP o internet no responde (%s). Espero %s y reintento (%d/%d)...",
+                                       exc, f"{espera / 60:g} min" if espera >= 60 else f"{espera:g} s", reintento + 1, maximo)
+                        time.sleep(espera)
                     except Exception as exc:
                         logger.exception("Error inesperado con CUIT %s, sigo con el siguiente cliente", bloque.cuit)
                         reporte.error(bloque, None, f"error inesperado: {exc}"[:200])
