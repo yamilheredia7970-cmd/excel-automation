@@ -127,6 +127,8 @@ TIMEOUT_NODO_MS = 6000
 TIMEOUT_CONTENIDO_VENTANA_MS = 8000
 MAX_MESES_SEGUIDOS_CON_ERROR = 3
 REINTENTOS_MENSAJE_ESICOL = 3   # veces que se abre una seccion si e-Sicol muestra un cuadro de error
+INTENTOS_LECTURA = 3          # veces que se lee un mes si e-Sicol lo da incompleto o con las cuentas sin cerrar
+ESTABILIDAD_S = 1.5           # en un reintento, segundos (x numero de intento) sin cambios para dar una ventana por cargada
 ESPERA_AGIP_CAIDA = 300       # segundos de espera si AGIP/internet no responde, antes de reintentar
 MAX_REINTENTOS_AGIP = 12      # ~1 hora seguida sin AGIP y recien ahi se corta la corrida
 GUARDAR_CADA_N_MESES = 4      # el Excel se guarda cada N meses y al terminar cada cliente
@@ -952,6 +954,11 @@ def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: Dato
             previo = celda.value
             if not isinstance(previo, (int, float)) or isinstance(previo, bool) or abs(float(previo) - valor) <= 0.01:
                 return
+            if (pisar and concepto in CONCEPTOS_CERO_EN_BLANCO and concepto != "saldo a favor"
+                    and abs(valor) < 0.005 and abs(float(previo)) >= 0.005):
+                # Un 0 de AGIP no borra un valor ya cargado: casi siempre es una ventana que salio vacia.
+                avisos.append(f"{concepto}: AGIP dice 0 pero la planilla tiene {previo}; no se piso (revisar)")
+                return
             # Un 0 en un mes pendiente es un casillero de relleno, y la alicuota
             # de la planilla es una anotacion: ahi manda AGIP. Cualquier otro
             # numero distinto no se toca (salvo --rehacer) y queda para revisar.
@@ -1255,6 +1262,7 @@ def pausar_entre_clientes() -> None:
 
 
 _capturas = {"contexto": "", "cantidad": {}}  # contexto: "CUIT_periodo" que se esta procesando
+_paciencia = {"factor": 1}  # 1 = lectura normal; 2, 3 = reintento con e-Sicol lento (ver leer_mes)
 
 
 def guardar_captura(page, motivo: str, es_error: bool = False) -> None:
@@ -2037,6 +2045,30 @@ def cerrar_ventanas(page, tiempo: int = 3000) -> int:
     return cerradas
 
 
+JS_HUELLA_VENTANA = r"""
+(w) => (w.innerText || '') + '|' + Array.from(w.querySelectorAll('input')).map((i) => i.value).join(',')
+"""
+
+
+def _esperar_estable(ventana, segundos: float) -> None:
+    """Espera a que lo que muestra la ventana deje de cambiar durante
+    'segundos'. Antes de que lleguen los datos, e-Sicol muestra valores por
+    defecto ($0,00) que se leerian como ceros de verdad."""
+    desde, anterior = time.monotonic(), None
+    limite = desde + max(4 * segundos, 10)
+    while time.monotonic() < limite:
+        try:
+            huella = ventana.evaluate(JS_HUELLA_VENTANA)
+        except Exception:
+            return
+        ahora = time.monotonic()
+        if huella != anterior:
+            anterior, desde = huella, ahora
+        elif ahora - desde >= segundos:
+            return
+        time.sleep(0.25)
+
+
 def esperar_ventana(page, tiempo: int):
     """La ventana que abrio el ultimo click, ya con su contenido cargado."""
     limite = time.monotonic() + tiempo / 1000
@@ -2054,7 +2086,8 @@ def esperar_ventana(page, tiempo: int):
         time.sleep(0.2)
     if ventana is None:
         return None
-    limite = time.monotonic() + TIMEOUT_CONTENIDO_VENTANA_MS / 1000
+    factor = _paciencia["factor"]
+    limite = time.monotonic() + TIMEOUT_CONTENIDO_VENTANA_MS * factor / 1000
     while time.monotonic() < limite:
         try:
             if ventana.evaluate(JS_VENTANA_CARGADA):
@@ -2062,6 +2095,8 @@ def esperar_ventana(page, tiempo: int):
         except Exception:
             break
         time.sleep(0.25)
+    if factor > 1:  # reintento por e-Sicol lento: no se lee hasta que el contenido deje de cambiar
+        _esperar_estable(ventana, ESTABILIDAD_S * factor)
     pausar(0.4, 0.15)
     return ventana
 
@@ -2276,6 +2311,77 @@ def extraer_campos(page, anio: int, mes: int, elegida: FilaDDJJ, tiempo: int) ->
     return datos
 
 
+CONCEPTOS_DEL_BALANCE = ("retenciones", "retenciones bancarias", "percepciones", "pago a cuenta")
+
+
+def lectura_dudosa(datos: DatosDDJJ, saldo_anterior: Optional[float] = None) -> Optional[str]:
+    """Por que no hay que fiarse de lo leido de una DDJJ (None si esta bien).
+    Cuando e-Sicol responde lento, las ventanas se leen vacias: faltan datos, o
+    retenciones y percepciones que valen algo salen en 0. Se nota porque la DDJJ
+    tiene que cerrar: anticipo - retenciones - retenciones bancarias -
+    percepciones - pago a cuenta - otros creditos = importe a pagar (si es
+    positivo) o saldo a favor (si es negativo). Para Otros Creditos se usa lo
+    mismo que despues escribe escribir_valores."""
+    c = datos.conceptos
+    faltan = [k for k in ("base imponible", "anticipo determinado", *CONCEPTOS_DEL_BALANCE, "otros creditos",
+                          *ETIQUETAS_LIQUIDACION) if k not in c]
+    if faltan:
+        return "no se pudo leer " + ", ".join(faltan)
+    otros = c["otros creditos"] if abs(c["otros creditos"]) >= 0.005 else (saldo_anterior or 0.0)
+    neto = c["anticipo determinado"] - otros - sum(c[k] for k in CONCEPTOS_DEL_BALANCE)
+    dif = max(abs(c["importe a pagar(subtotal)"] - max(neto, 0.0)), abs(c["saldo a favor"] - max(-neto, 0.0)))
+    if dif > TOLERANCIA_AUDITORIA:
+        return f"las cuentas no cierran (diferencia ${dif:,.2f})"
+    return None
+
+
+def leer_mes(page, bloque: BloqueCliente, mes: int, tiempo_espera: int, saldo_anterior: Optional[float]
+             ) -> Tuple[ResultadoLista, Optional[DatosDDJJ], Optional[str]]:
+    """Abre la DDJJ del mes y lee sus datos. Si e-Sicol anda lento no se llega
+    a la lista, o las ventanas se leen vacias; cuando lo leido no es confiable
+    (ver lectura_dudosa) se vuelve a empezar, hasta INTENTOS_LECTURA veces y
+    esperando mas en cada una. Devuelve (lista, datos, motivo): motivo es None
+    si la lectura es confiable; datos es None si el mes no tiene DDJJ o se
+    abrio otra distinta de la pedida."""
+    etiqueta = f"{MESES[mes - 1]}/{bloque.anio}"
+    ultimo = None
+    try:
+        for intento in range(1, INTENTOS_LECTURA + 1):
+            _paciencia["factor"] = intento
+            tiempo = tiempo_espera * intento
+            try:
+                resultado = ir_a_declaracion(page, bloque.anio, mes, tiempo, bloque.cuit)
+                if resultado.elegida is None:
+                    if ultimo is None:
+                        return resultado, None, None
+                    break   # en este reintento la lista no la mostro: se queda con la lectura anterior
+                if intento == 1:
+                    logger.info("CUIT %s: %s -> abro '%s' (presentada el %s)", bloque.cuit, etiqueta,
+                                resultado.elegida.tipo, resultado.elegida.fecha or "?")
+                datos = extraer_campos(page, bloque.anio, mes, resultado.elegida, tiempo)
+            except ErrorNavegacion as exc:
+                if intento == INTENTOS_LECTURA and ultimo is None:
+                    raise
+                logger.warning("CUIT %s: %s: %s -> reintento", bloque.cuit, etiqueta, exc)
+                pausar(5 * intento, 2)
+                continue
+            if datos is None:
+                if ultimo is None:
+                    return resultado, None, None
+                break
+            motivo = lectura_dudosa(datos, saldo_anterior)
+            ultimo = (resultado, datos, motivo)
+            if not motivo:
+                break
+            if intento < INTENTOS_LECTURA:
+                logger.warning("CUIT %s: %s: lectura dudosa (%s) -> la leo de nuevo, esperando mas",
+                               bloque.cuit, etiqueta, motivo)
+                pausar(5 * intento, 2)
+    finally:
+        _paciencia["factor"] = 1
+    return ultimo
+
+
 def _resumen_valores(datos: DatosDDJJ) -> str:
     abreviaturas = [("base imponible", "base"), ("anticipo determinado", "anticipo"),
                     ("percepciones", "percep"), ("retenciones", "ret"), ("retenciones bancarias", "ret.banc"),
@@ -2367,15 +2473,8 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
             reporte.falta_ddjj(bloque, mes)
             continue
         try:
-            for intento in (1, 2):  # el primer mes tras el login a veces no carga: se reintenta una vez
-                try:
-                    resultado = ir_a_declaracion(pagina, bloque.anio, mes, tiempo_espera, bloque.cuit)
-                    break
-                except ErrorNavegacion as exc:
-                    if intento == 2:
-                        raise
-                    logger.warning("CUIT %s: %s: %s -> reintento", bloque.cuit, etiqueta, exc)
-                    pausar(5, 2)
+            saldo_anterior = saldo_a_favor_anterior(ws.parent, indice or {}, bloque, mes)
+            resultado, datos, dudosa = leer_mes(pagina, bloque, mes, tiempo_espera, saldo_anterior)
             if resultado.completa:
                 periodos_existentes = resultado.periodos
             if resultado.elegida is None:
@@ -2383,17 +2482,14 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
                 reporte.falta_ddjj(bloque, mes)
                 meses_con_error_seguidos = 0
                 continue
-            elegida = resultado.elegida
-            logger.info("CUIT %s: %s -> abro '%s' (presentada el %s)",
-                        bloque.cuit, etiqueta, elegida.tipo, elegida.fecha or "?")
-            datos = extraer_campos(pagina, bloque.anio, mes, elegida, tiempo_espera)
             if datos is None:
                 reporte.error(bloque, mes, "la DDJJ que se abrio no era la pedida; no se escribio nada")
                 guardar_captura(pagina, "ddjj equivocada", es_error=True)
                 meses_con_error_seguidos += 1
             else:
-                saldo_anterior = saldo_a_favor_anterior(ws.parent, indice or {}, bloque, mes)
                 avisos = datos.avisos + escribir_valores(ws, bloque, mes, datos, saldo_anterior, rehacer, indice)
+                if dudosa:
+                    avisos.append(f"lectura dudosa tras {INTENTOS_LECTURA} intentos: {dudosa}")
                 guardados += 1
                 if guardados % GUARDAR_CADA_N_MESES == 0:
                     guardar_cb()
