@@ -20,6 +20,7 @@ python iibb_agip_scraper.py --excel "RUTA\IIBB ANUAL 2025-4.xlsx" --sin-headless
 | `--auditar` | Solo lectura. Lista los meses cuyas cuentas no cierran (anticipo − retenciones − percepciones − créditos ≠ importe a pagar / saldo a favor). Suele faltar una actividad o un crédito. |
 | `--corregir` | Relee de AGIP **solo** esos meses y reemplaza lo que difiera. Se combina con `--anios` y `--cuit`. |
 | `--rehacer` | Relee los meses indicados (con `--cuit` / `--meses`) aunque ya tengan datos. AGIP manda. |
+| `--actividades` | Solo completa el **código y la descripción de la actividad** donde faltan (columna A y B, debajo de la alícuota), leyéndolos de una DDJJ de AGIP del mismo año. La corrida normal también lo hace. Los que no se pueden (sin DDJJ, o AGIP trae más actividades que bloques) salen en *SIN CODIGO DE ACTIVIDAD*. |
 | `--cuit A,B` `--meses 1,2` `--anios 2025` | Filtros para probar o corregir. |
 | `--restaurar-colores` | Recupera del backup (`*.backup.xlsx`) los colores puestos a mano. |
 | `--dry-run` | Solo lectura: resumen de clientes y meses pendientes. |

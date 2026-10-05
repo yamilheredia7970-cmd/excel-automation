@@ -922,6 +922,47 @@ def _completar_codigo(ws: Worksheet, bloque: BloqueCliente, destino: BloqueActiv
         destino.codigo, destino.descripcion, destino.fila_codigo = act.codigo, act.descripcion, fila
 
 
+def _fila_libre_codigo(ws: Worksheet, bloque: BloqueCliente, act: BloqueActividad) -> Optional[int]:
+    """Fila donde va el codigo y la descripcion de una actividad que no los
+    tiene: la que sigue a su alicuota, si esta vacia (en el bloque principal es
+    la que queda entre la alicuota y el CUIT, como en la planilla de la contadora)."""
+    fa = act.fila_alicuota
+    if act.codigo or not fa:
+        return None
+    fila = fa + 1
+    if act is bloque.actividades[0] and bloque.fila_cuit != fila + 1:
+        return None
+    if fila == bloque.fila_cuit or not (_vacia(ws.cell(row=fila, column=1).value)
+                                        and _vacia(ws.cell(row=fila, column=2).value)):
+        return None
+    return fila
+
+
+def faltan_codigos(ws: Worksheet, bloque: BloqueCliente) -> bool:
+    return any(_fila_libre_codigo(ws, bloque, a) for a in bloque.actividades)
+
+
+def asignar_codigos(agip: List["Actividad"], libres: List[Tuple[BloqueActividad, Optional[float]]],
+                    usados: Set[str]) -> List[Tuple["Actividad", BloqueActividad]]:
+    """Empareja las actividades de AGIP con los bloques de la planilla que no
+    tienen codigo. 'libres' trae cada bloque con su base del mes leido: se
+    emparejan los que tienen la misma base (+/- $1) y, si queda un solo bloque
+    y una sola actividad, esos dos. Lo dudoso no se asigna."""
+    candidatas = [a for a in agip if a.codigo not in usados]
+    pares: List[Tuple["Actividad", BloqueActividad]] = []
+    restantes = []
+    for destino, base in libres:
+        iguales = [a for a in candidatas if base is not None and a.base is not None and abs(a.base - base) <= 1.0]
+        if len(iguales) == 1:
+            pares.append((iguales[0], destino))
+            candidatas.remove(iguales[0])
+        else:
+            restantes.append(destino)
+    if len(restantes) == 1 and len(candidatas) == 1:
+        pares.append((candidatas[0], restantes[0]))
+    return pares
+
+
 def escribir_valores(ws: Worksheet, bloque: BloqueCliente, mes: int, datos: DatosDDJJ,
                      saldo_anterior: Optional[float] = None, pisar: bool = False,
                      indice: Optional[Dict[Tuple[int, int], BloqueCliente]] = None) -> List[str]:
@@ -2382,6 +2423,62 @@ def leer_mes(page, bloque: BloqueCliente, mes: int, tiempo_espera: int, saldo_an
     return ultimo
 
 
+def completar_actividades(page, ws: Worksheet, bloque: BloqueCliente, tiempo_espera: int, reporte: "Reporte") -> int:
+    """Escribe el codigo y la descripcion de la actividad en los bloques del
+    cliente que no los tienen, leyendolos de una DDJJ de AGIP de ese anio (la
+    del ultimo mes con datos en la planilla; si no hay, una que AGIP tenga).
+    Devuelve cuantos codigos escribio."""
+    libres = [a for a in bloque.actividades if _fila_libre_codigo(ws, bloque, a)]
+    if not libres:
+        return 0
+    cliente = Reporte._quien(bloque, None)
+
+    def base_del_mes(act: BloqueActividad, mes: int) -> Optional[float]:
+        col = bloque.columnas_mes.get(mes)
+        v = ws[f"{col}{act.fila_base}"].value if col else None
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+    con_base = [mes for mes in sorted(bloque.columnas_mes, reverse=True)
+                if any(base_del_mes(a, mes) for a in bloque.actividades)]
+    mes = con_base[0] if con_base else 12
+    vistos: Set[int] = set()
+    try:
+        for _ in range(3):
+            resultado = ir_a_declaracion(page, bloque.anio, mes, tiempo_espera, bloque.cuit)
+            if resultado.elegida:
+                break
+            vistos.add(mes)   # ese mes no tiene DDJJ: se prueba con uno del anio que AGIP si tenga
+            otros = sorted((int(p[5:]) for p in resultado.periodos if p.startswith(f"{bloque.anio}-")), reverse=True)
+            otros = [o for o in otros if o not in vistos]
+            if not otros:
+                break
+            mes = otros[0]
+        if not resultado.elegida:
+            reporte.sin_actividad.append(f"{cliente}: AGIP no tiene DDJJ presentadas de {bloque.anio}, no se sabe la actividad")
+            return 0
+        datos = extraer_campos(page, bloque.anio, mes, resultado.elegida, tiempo_espera)
+    except ErrorNavegacion as exc:
+        reporte.sin_actividad.append(f"{cliente}: no pude abrir una DDJJ de AGIP para leer la actividad ({exc})")
+        return 0
+    if datos is None or not datos.actividades:
+        reporte.sin_actividad.append(f"{cliente}: no pude leer las actividades de la DDJJ de {MESES[mes - 1]}/{bloque.anio}")
+        return 0
+    pares = asignar_codigos(datos.actividades, [(a, base_del_mes(a, mes)) for a in libres],
+                            {a.codigo for a in bloque.actividades if a.codigo})
+    for act, destino in pares:
+        fila = _fila_libre_codigo(ws, bloque, destino)
+        _escribir_fila_codigo(ws, fila, (act.codigo, act.descripcion))
+        destino.codigo, destino.descripcion, destino.fila_codigo = act.codigo, act.descripcion, fila
+        logger.info("  %s: actividad %s (%s) escrita en %s fila %d", bloque.nombre, act.codigo,
+                    act.descripcion[:40], ws.title, fila)
+    if len(pares) < len(libres):
+        reporte.sin_actividad.append(
+            f"{cliente}: AGIP informa {len(datos.actividades)} actividad(es) "
+            f"({'; '.join(f'{a.codigo} {a.descripcion[:30]}' for a in datos.actividades)}) y no pude asignarlas "
+            f"a los {len(libres) - len(pares)} bloque(s) sin codigo")
+    return len(pares)
+
+
 def _resumen_valores(datos: DatosDDJJ) -> str:
     abreviaturas = [("base imponible", "base"), ("anticipo determinado", "anticipo"),
                     ("percepciones", "percep"), ("retenciones", "ret"), ("retenciones bancarias", "ret.banc"),
@@ -2405,6 +2502,7 @@ class Reporte:
     sin_procesar: List[str] = field(default_factory=list)
     sin_entrar: Set[Tuple[int, int]] = field(default_factory=set)   # ninguna contrasena funciono
     entraron: Set[Tuple[int, int]] = field(default_factory=set)   # la corrida se corto antes de llegar a ellos
+    sin_actividad: List[str] = field(default_factory=list)   # clientes cuya actividad no se pudo completar
 
     @staticmethod
     def _quien(bloque: BloqueCliente, mes: Optional[int]) -> str:
@@ -2429,6 +2527,10 @@ class Reporte:
         if self.revisar:
             logger.info("--- REVISAR A MANO (%d) ---", len(self.revisar))
             for linea in self.revisar:
+                logger.info("  %s", linea)
+        if self.sin_actividad:
+            logger.info("--- SIN CODIGO DE ACTIVIDAD: completar a mano (%d) ---", len(self.sin_actividad))
+            for linea in self.sin_actividad:
                 logger.info("  %s", linea)
         if self.sin_ddjj:
             logger.info("--- Meses sin DDJJ presentada en AGIP (%d clientes) ---", len(self.sin_ddjj))
@@ -2512,6 +2614,18 @@ def procesar_cliente(page, ws: Worksheet, bloque: BloqueCliente, pendientes: Lis
             logger.error("CUIT %s: %d meses seguidos con error, paso al siguiente cliente",
                           bloque.cuit, meses_con_error_seguidos)
             break
+    if faltan_codigos(ws, bloque):
+        try:
+            if completar_actividades(pagina, ws, bloque, tiempo_espera, reporte):
+                guardados += 1
+        except Exception as exc:
+            logger.warning("CUIT %s: no pude completar la actividad: %s", bloque.cuit,
+                           str(exc).splitlines()[0][:120] if str(exc) else type(exc).__name__)
+        finally:
+            try:
+                cerrar_ventanas(pagina)
+            except Exception:
+                pass
     if guardados % GUARDAR_CADA_N_MESES:
         guardar_cb()
     return True
@@ -2580,7 +2694,7 @@ def candidatas_password(bloque: BloqueCliente, es_cuit_filtrado: bool,
 def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: set,
                       cuit_filtro: Optional[Set[int]], password_override: Optional[str],
                       meses_filtro: Optional[Set[int]] = None, rehacer: bool = False,
-                      descuadrados: bool = False
+                      descuadrados: bool = False, solo_actividades: bool = False
                       ) -> List[Tuple[BloqueCliente, Worksheet, List[int], List[str]]]:
     """Arma la lista de (bloque, hoja, meses_pendientes, candidatas_password)
     a procesar, ordenada por anio (todos los de 2024 antes que cualquiera
@@ -2595,7 +2709,9 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
         ws = wb[bloque.hoja]
         # --rehacer: los meses pedidos se vuelven a leer aunque ya tengan datos.
         # --corregir: solo los meses cuyas cuentas no cierran.
-        if descuadrados:
+        if solo_actividades:
+            pendientes = []
+        elif descuadrados:
             pendientes = [mes for mes, _ in meses_que_no_cierran(wb, bloque)]
         elif rehacer:
             pendientes = sorted(bloque.columnas_mes)
@@ -2603,7 +2719,9 @@ def calcular_trabajo(wb, indice: Dict[Tuple[int, int], BloqueCliente], anios: se
             pendientes = meses_pendientes(ws, bloque)
         if meses_filtro:
             pendientes = [m for m in pendientes if m in meses_filtro]
-        if not pendientes:
+        # Los clientes a los que les falta el codigo de actividad tambien se visitan (salvo al corregir o rehacer meses).
+        con_actividad = solo_actividades or not (descuadrados or rehacer or meses_filtro)
+        if not pendientes and not (con_actividad and faltan_codigos(ws, bloque)):
             continue
         candidatas = candidatas_password(bloque, bool(cuit_filtro) and len(cuit_filtro) == 1 and cuit in cuit_filtro, password_override)
         trabajo.append((bloque, ws, pendientes, candidatas))
@@ -2834,6 +2952,9 @@ def construir_argumentos() -> argparse.Namespace:
     parser.add_argument("--corregir", action="store_true",
                          help="Vuelve a leer de AGIP SOLO los meses cuyas cuentas no cierran (ver --auditar) y reemplaza "
                               "lo que difiera. Se combina con --anios y --cuit")
+    parser.add_argument("--actividades", action="store_true",
+                         help="Solo completa el codigo y la descripcion de la actividad donde faltan (no relee meses). "
+                              "Sin esta opcion, la corrida normal tambien lo hace. Se combina con --anios y --cuit")
     parser.add_argument("--rehacer", action="store_true",
                          help="Vuelve a leer los meses indicados (con --cuit y/o --meses) aunque ya tengan datos, "
                               "y AGIP reemplaza lo que haya en la planilla")
@@ -2925,7 +3046,8 @@ def main() -> None:
         indice = indexar_workbook(wb)
 
     cuits = {int(c) for c in args.cuit.replace(" ", "").split(",") if c} if args.cuit else None
-    trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer, args.corregir)
+    trabajo = calcular_trabajo(wb, indice, anios, cuits, args.password, meses_filtro, args.rehacer, args.corregir,
+                              args.actividades)
     logger.info("Clientes con meses pendientes: %d", len(trabajo))
 
     if args.max_clientes:
